@@ -41,11 +41,11 @@ Body: `{ "username", "password", "email"? }`
 - **With `email`** → new flow:
   - Validates email format (`invalid_email` → 400), unique username
     (`username_taken` → 409), unique email (`email_taken` → 409).
-  - If the server has no SMTP configured → **503 `{error:"email_not_configured"}`**
+  - If the server has no SMTP configured → **422 `{error:"email_not_configured"}`**
     and no account is created (retry later — never a fake success).
   - Otherwise creates an **UNVERIFIED** account, emails a 6-digit code
     (10-minute expiry) → `200 {ok:true, email, message}`.
-  - If the account was created but the mail failed → `502 {error:"email_send_failed"}`;
+  - If the account was created but the mail failed → `422 {error:"email_send_failed"}`;
     the user can retry via `/api/resend-code`.
 
 ### POST /api/login
@@ -71,8 +71,8 @@ Body: `{ "email", "code" }` → `200 {ok:true, token, username}` (auto-logs in).
 Body: `{ "email" }` → `200 {ok:true}`.
 
 - Rate-limited: one code per email per 60s → `429 {error:"too_soon", retryAfter}`.
-- `503 {error:"email_not_configured"}` when SMTP is missing.
-- `502 {error:"email_send_failed"}` when the mail genuinely fails to send.
+- `422 {error:"email_not_configured"}` when SMTP is missing.
+- `422 {error:"email_send_failed"}` when the mail genuinely fails to send.
 - Unknown/already-verified emails still return `{ok:true}` (no account probing).
 - **Also works for pending email changes:** pass the *new* (pending) address —
   a fresh code is generated and sent to it.
@@ -80,7 +80,7 @@ Body: `{ "email" }` → `200 {ok:true}`.
 ### POST /api/forgot-password — **v3**
 Body: `{ "email" }` → **always** `200 {ok:true}` (never reveals whether the
 email is registered). If the account exists, a 6-digit reset code (10 min) is
-emailed. `503 {error:"email_not_configured"}` when SMTP is missing.
+emailed. `422 {error:"email_not_configured"}` when SMTP is missing.
 
 ### POST /api/reset-password — **v3**
 Body: `{ "email", "code", "newPassword" }` → `200 {ok:true}`.
@@ -103,7 +103,7 @@ sets the email, marks the account **unverified**, emails a code.
 
 - `400 {error:"already_set"}` if the account already has an email.
 - `409 {error:"email_taken"}`, `400 {error:"invalid_email"}`.
-- `503 {error:"email_not_configured"}` when SMTP is missing.
+- `422 {error:"email_not_configured"}` when SMTP is missing.
 
 ### POST /api/logout · GET /api/me · POST /api/me
 Logout is unchanged; both also accept the API token now.
@@ -133,8 +133,8 @@ checked against both current and pending addresses); `400 {error:"same_email"}`
 if unchanged. Stores the new address as `pending_email`, generates a 6-digit
 code (10 min) and **really sends it to the NEW address** via SMTP:
 
-- `503 {error:"email_not_configured"}` when SMTP is missing.
-- `502 {error:"email_send_failed"}` when sending genuinely fails (logged server-side).
+- `422 {error:"email_not_configured"}` when SMTP is missing.
+- `422 {error:"email_send_failed"}` when sending genuinely fails (logged server-side).
 - Success → `200 {ok:true, pendingEmail, message}`.
 - Complete with `POST /api/verify-email {email:newEmail, code}`; resend with
   `POST /api/resend-code {email:newEmail}`. The old address keeps working until
@@ -150,9 +150,9 @@ Google sign-in. Body: `{ "idToken", "username"? }`.
   free, otherwise one derived from the email prefix (made unique); the account
   is created `verified=true` with the Google email stored.
 - → `200 {ok:true, token, username}` (cookie also set).
-- `503 {error:"google_not_configured"}` when `GOOGLE_CLIENT_ID` is not set.
+- `422 {error:"google_not_configured"}` when `GOOGLE_CLIENT_ID` is not set.
 - `401 {error:"invalid_token"}` / `{error:"invalid_audience"}`,
-  `403 {error:"email_not_verified"}`, `502 {error:"google_unreachable"}`.
+  `403 {error:"email_not_verified"}`, `422 {error:"google_unreachable"}`.
 
 ---
 
@@ -351,11 +351,11 @@ GOOGLE_CLIENT_ID=1234567890-abc.apps.googleusercontent.com   # for Google sign-i
 **Email is always genuinely delivered** via nodemailer + the SMTP settings
 above — never simulated, logged-and-pretended, or skipped. Until SMTP is set,
 registration-with-email, resend-code, forgot-password, set-email and
-change-email answer `503 {error:"email_not_configured"}`; genuine send
+change-email answer `422 {error:"email_not_configured"}`; genuine send
 failures are logged server-side (`[mail] ...`) and answered
-`502 {error:"email_send_failed"}`, and nothing is ever marked verified on
+`422 {error:"email_send_failed"}`, and nothing is ever marked verified on
 failure. Legacy username/password accounts keep working without email.
-Google sign-in answers `503 {error:"google_not_configured"}` until
+Google sign-in answers `422 {error:"google_not_configured"}` until
 `GOOGLE_CLIENT_ID` is set.
 
 ---
@@ -375,3 +375,5 @@ databases upgrade in place:
   new `statuses`, `channels`, `channel_subs`, `channel_posts` tables.
 
 Auth tokens = rows in the existing `sessions` table (shared by cookie + API).
+
+> **Note (2026-10-01):** mail/config errors use HTTP 422 instead of 503/502 because the hosting proxy intercepts 5xx responses and replaces them with its own error page. Clients must read the `error` field in the JSON body.

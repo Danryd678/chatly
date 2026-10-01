@@ -61,6 +61,10 @@ const smtpConfigured = () => Boolean(SMTP.host && SMTP.user && SMTP.pass);
 // `aud` claim of Google's ID tokens. Missing → /api/auth/google answers 503.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 
+// NOTE (2026-10-01): mail/config problems answer HTTP 422 (not 503/502): the
+// hosting edge proxy swallows 5xx responses and substitutes its own error
+// page. Clients read the JSON `error` field, never the status code.
+
 // ---------------------------------------------------------------- database
 
 mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -622,7 +626,7 @@ app.post('/api/register', rateLimit('register', 10), async (req, res) => {
     // Honest failure: no account is created, the client can retry once the
     // server owner configures SMTP.
     return res
-      .status(503)
+      .status(422)
       .json({ error: 'email_not_configured', message: 'Email is not configured on this server yet.' });
   }
   const code = genCode();
@@ -641,11 +645,11 @@ app.post('/api/register', rateLimit('register', 10), async (req, res) => {
   } catch (e) {
     logMailError('register', e);
     if (e.code === 'email_not_configured') {
-      return res.status(503).json({ error: 'email_not_configured' });
+      return res.status(422).json({ error: 'email_not_configured' });
     }
     // Account exists but the mail didn't go out: leave it unverified so the
     // user can use /api/resend-code later. Never fake success.
-    return res.status(502).json({
+    return res.status(422).json({
       ok: false,
       error: 'email_send_failed',
       message: 'Account created, but the verification email could not be sent. Try resending the code.',
@@ -726,7 +730,7 @@ app.post('/api/me', selfProfileHandler);
 // 503 {error:"google_not_configured"} when GOOGLE_CLIENT_ID is missing.
 app.post('/api/auth/google', rateLimit('google', 20), async (req, res) => {
   if (!GOOGLE_CLIENT_ID) {
-    return res.status(503).json({
+    return res.status(422).json({
       error: 'google_not_configured',
       message: 'Google sign-in is not configured on this server yet.',
     });
@@ -747,7 +751,7 @@ app.post('/api/auth/google', rateLimit('google', 20), async (req, res) => {
     info = await r.json();
   } catch (e) {
     console.error('[auth] google tokeninfo unreachable:', (e && e.message) || e);
-    return res.status(502).json({ error: 'google_unreachable', message: 'Could not reach Google.' });
+    return res.status(422).json({ error: 'google_unreachable', message: 'Could not reach Google.' });
   }
   if (info.aud !== GOOGLE_CLIENT_ID) {
     return res.status(401).json({ error: 'invalid_audience', message: 'Token was not issued for this app.' });
@@ -847,7 +851,7 @@ app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
     });
   }
   if (!smtpConfigured()) {
-    return res.status(503).json({ error: 'email_not_configured' });
+    return res.status(422).json({ error: 'email_not_configured' });
   }
   const user =
     getUserByEmail(mail) ||
@@ -863,8 +867,8 @@ app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
         await sendMail(mail, 'Your Chatly verification code', verifyEmailText(code));
       } catch (e) {
         logMailError('resend-code (pending change)', e);
-        if (e.code === 'email_not_configured') return res.status(503).json({ error: 'email_not_configured' });
-        return res.status(502).json({ error: 'email_send_failed', message: 'Could not send the email.' });
+        if (e.code === 'email_not_configured') return res.status(422).json({ error: 'email_not_configured' });
+        return res.status(422).json({ error: 'email_send_failed', message: 'Could not send the email.' });
       }
     } else if (!user.verified) {
       // New-account verification.
@@ -875,8 +879,8 @@ app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
         await sendMail(mail, 'Your Chatly verification code', verifyEmailText(code));
       } catch (e) {
         logMailError('resend-code', e);
-        if (e.code === 'email_not_configured') return res.status(503).json({ error: 'email_not_configured' });
-        return res.status(502).json({ error: 'email_send_failed', message: 'Could not send the email.' });
+        if (e.code === 'email_not_configured') return res.status(422).json({ error: 'email_not_configured' });
+        return res.status(422).json({ error: 'email_send_failed', message: 'Could not send the email.' });
       }
     }
     // Unknown or already-verified emails: same {ok:true}, don't leak existence.
@@ -890,7 +894,7 @@ app.post('/api/forgot-password', rateLimit('forgot', 10), async (req, res) => {
   const mail = normalizeEmail(req.body && req.body.email);
   if (!mail) return res.status(400).json({ error: 'bad_request', message: 'Email required.' });
   if (!smtpConfigured()) {
-    return res.status(503).json({ error: 'email_not_configured' });
+    return res.status(422).json({ error: 'email_not_configured' });
   }
   const user = getUserByEmail(mail);
   if (user) {
@@ -970,7 +974,7 @@ app.post('/api/set-email', rateLimit('setemail', 10), async (req, res) => {
     return res.status(409).json({ error: 'email_taken', message: 'That email is already registered.' });
   }
   if (!smtpConfigured()) {
-    return res.status(503).json({ error: 'email_not_configured' });
+    return res.status(422).json({ error: 'email_not_configured' });
   }
   const code = genCode();
   db.prepare('UPDATE users SET email = ?, verified = 0, verify_code = ?, verify_expiry = ? WHERE id = ?')
@@ -979,8 +983,8 @@ app.post('/api/set-email', rateLimit('setemail', 10), async (req, res) => {
     await sendMail(mail, 'Your Chatly verification code', verifyEmailText(code));
   } catch (e) {
     logMailError('set-email', e);
-    if (e.code === 'email_not_configured') return res.status(503).json({ error: 'email_not_configured' });
-    return res.status(502).json({ error: 'email_send_failed' });
+    if (e.code === 'email_not_configured') return res.status(422).json({ error: 'email_not_configured' });
+    return res.status(422).json({ error: 'email_send_failed' });
   }
   res.json({ ok: true, email: mail, message: 'Verification code sent. Check your inbox.' });
 });
@@ -1009,7 +1013,7 @@ app.post('/api/change-email', rateLimit('changeemail', 10), async (req, res) => 
     return res.status(409).json({ error: 'email_taken', message: 'That email is already registered.' });
   }
   if (!smtpConfigured()) {
-    return res.status(503).json({
+    return res.status(422).json({
       error: 'email_not_configured',
       message: 'Email is not configured on this server yet.',
     });
@@ -1021,8 +1025,8 @@ app.post('/api/change-email', rateLimit('changeemail', 10), async (req, res) => 
     await sendMail(newMail, 'Your Chatly verification code', verifyEmailText(code));
   } catch (e) {
     logMailError('change-email', e);
-    if (e.code === 'email_not_configured') return res.status(503).json({ error: 'email_not_configured' });
-    return res.status(502).json({ error: 'email_send_failed', message: 'Could not send the email.' });
+    if (e.code === 'email_not_configured') return res.status(422).json({ error: 'email_not_configured' });
+    return res.status(422).json({ error: 'email_send_failed', message: 'Could not send the email.' });
   }
   res.json({ ok: true, pendingEmail: newMail, message: 'Verification code sent to your new address.' });
 });
