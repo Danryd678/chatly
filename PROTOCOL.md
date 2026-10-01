@@ -115,7 +115,8 @@ Logout is unchanged; both also accept the API token now.
 {
   "user": { "id": 1, "username": "anna" },
   "username": "anna", "name": "Anna", "bio": "...", "avatar": "data:...",
-  "email": "anna@yahoo.com", "verified": true, "online": false
+  "email": "anna@yahoo.com", "verified": true, "online": false,
+  "privacy": { "lastSeen": "everyone", "photo": "everyone", "about": "everyone" }
 }
 ```
 
@@ -168,8 +169,25 @@ Body: `{ "token", "name"?, "bio"?, "avatar"? }` → `200 {ok:true, profile}`.
 - Omitted fields keep their current values.
 
 ### GET /api/profile/:username
-Public: `200 {username, name, bio, avatar, online}` (`online` = has a live socket).
+Public: `200 {username, name, bio, avatar, online, last_seen}` (`online` = has a live socket;
+`last_seen` = epoch ms of last activity, or `null`).
 `404 {error:"not_found"}` for unknown users.
+Honors the target's privacy settings: `avatar` is `null` when their photo visibility is
+"nobody" (unless you're viewing your own profile), `bio` is `""` when their about visibility
+is "nobody", and `last_seen` is `null` when their last-seen visibility is "nobody".
+Auth is optional — pass a token to be recognized as the owner.
+
+### POST /api/set-privacy — **v3.2**
+Body: `{ "token", "lastSeen"?, "photo"?, "about"? }` — each value `"everyone"` or `"nobody"`.
+→ `200 {ok:true, privacy:{lastSeen, photo, about}}`.
+Invalid values → `422 {error:"invalid_privacy"}`. Read receipts are client-side only
+(the app simply stops sending WS `read` events) and are not stored here.
+`GET /api/me` includes the caller's `privacy` object.
+
+### POST /api/delete-account — **v3.2**
+Body: `{ "token", "password" }` → `200 {ok:true}`. Verifies the password, then permanently
+deletes the account and all of its data (messages, groups it created, statuses, channel
+subscriptions, sessions, block-list entries). Wrong password → `403 {error:"bad_password"}`.
 
 ---
 
@@ -244,7 +262,9 @@ Expired statuses (older than 24h) are purged on every read.
 
 ## 6. 1:1 chats (unchanged endpoints, richer message shape)
 
-- `GET /api/users?q=` — search users (auth required).
+- `GET /api/users?q=` — search users (auth required). Each result is
+  `{id, username, last_seen}`; `last_seen` is `null` when that user set last-seen
+  visibility to "nobody".
 - `GET /api/chats` — conversation list with last message + unread counts.
 - `GET /api/messages/:partnerId?before=&limit=` — history (expired messages
   excluded); opening the latest view marks messages read (as before).
