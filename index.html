@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#075e54" />
+  <title>Chatly</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app">
+
+    <!-- Auth view -->
+    <section id="view-auth" class="view">
+      <div class="auth-card">
+        <h1 class="logo">Chatly</h1>
+        <p class="tagline">A simple, private messenger you host yourself.</p>
+        <div class="tabs">
+          <button id="tab-login" class="tab active">Log in</button>
+          <button id="tab-register" class="tab">Sign up</button>
+        </div>
+        <form id="form-auth" autocomplete="on">
+          <input id="input-username" type="text" placeholder="Username (3–20 letters, numbers, _)"
+                 autocomplete="username" minlength="3" maxlength="20" required />
+          <input id="input-password" type="password" placeholder="Password (min 6 characters)"
+                 autocomplete="current-password" minlength="6" required />
+          <button type="submit" id="btn-auth" class="btn-primary">Log in</button>
+        </form>
+        <p id="auth-error" class="error" hidden></p>
+      </div>
+    </section>
+
+    <!-- Chat list view -->
+    <section id="view-chats" class="view" hidden>
+      <header class="topbar">
+        <span class="logo small">Chatly</span>
+        <div class="topbar-actions">
+          <button id="btn-newchat" class="icon-btn" title="New chat" aria-label="New chat">＋</button>
+          <button id="btn-profile" class="icon-btn" title="Profile" aria-label="Profile">⚙</button>
+        </div>
+      </header>
+      <div id="newchat-panel" hidden>
+        <input id="input-search" type="search" placeholder="Search users by username…" />
+        <ul id="search-results" class="user-list"></ul>
+      </div>
+      <div id="conn-banner" class="conn-banner" hidden>Reconnecting…</div>
+      <ul id="chat-list" class="chat-list"></ul>
+      <p id="chats-empty" class="empty" hidden>
+        No chats yet.<br />Tap ＋ to find someone and say hi.
+      </p>
+    </section>
+
+    <!-- Conversation view -->
+    <section id="view-convo" class="view" hidden>
+      <header class="topbar convo-header">
+        <button id="btn-back" class="icon-btn" aria-label="Back">←</button>
+        <div class="convo-title">
+          <span id="convo-name"></span>
+          <span id="convo-status" class="convo-status"></span>
+        </div>
+      </header>
+      <div id="conn-banner-convo" class="conn-banner" hidden>Reconnecting…</div>
+      <div id="messages" class="messages"></div>
+      <div id="typing-line" class="typing-line" hidden></div>
+      <form id="form-send" class="sendbar">
+        <input id="input-message" type="text" placeholder="Type a message" maxlength="2000"
+               autocomplete="off" />
+        <button type="submit" class="btn-send" aria-label="Send">➤</button>
+      </form>
+    </section>
+
+    <!-- Profile view -->
+    <section id="view-profile" class="view" hidden>
+      <header class="topbar">
+        <button id="btn-back-profile" class="icon-btn" aria-label="Back">←</button>
+        <span class="logo small">Profile</span>
+      </header>
+      <div class="profile-card">
+        <div id="profile-avatar" class="avatar large"></div>
+        <h2 id="profile-username"></h2>
+        <p class="muted">Messages are stored on the Chatly server you signed up on.</p>
+        <button id="btn-logout" class="btn-danger">Log out</button>
+      </div>
+    </section>
+
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
