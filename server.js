@@ -161,6 +161,10 @@ ensureColumn('users', 'pending_email', 'TEXT'); // new address awaiting verifica
 ensureColumn('users', 'pending_code', 'TEXT');
 ensureColumn('users', 'pending_expiry', 'INTEGER');
 
+// --- v3.2 migrations: privacy settings + last seen --------------------------
+ensureColumn('users', 'privacy', "TEXT NOT NULL DEFAULT '{}'"); // JSON: {lastSeen,photo,about} each "everyone"|"nobody"
+ensureColumn('users', 'last_seen', 'INTEGER'); // epoch ms of last activity (WS connect/disconnect)
+
 // --- v3.1: statuses (24h stories) -------------------------------------------
 db.exec(`
   CREATE TABLE IF NOT EXISTS statuses (
@@ -370,14 +374,34 @@ function setBlockedIds(userId, ids) {
   db.prepare('UPDATE users SET blocked = ? WHERE id = ?').run(JSON.stringify([...ids]), userId);
 }
 
-function publicProfile(user) {
+function publicProfile(user, viewer) {
+  const priv = getPrivacy(user);
+  const isOwner = viewer && viewer.id === user.id;
   return {
     username: user.username,
     name: user.display_name || user.username,
-    bio: user.bio || '',
-    avatar: user.avatar || null,
+    bio: isOwner || priv.about !== 'nobody' ? user.bio || '' : '',
+    avatar: isOwner || priv.photo !== 'nobody' ? user.avatar || null : null,
     online: onlineIds().includes(user.id),
+    last_seen: isOwner || priv.lastSeen !== 'nobody' ? user.last_seen || null : null,
   };
+}
+
+// Privacy settings live on users.privacy as JSON {lastSeen,photo,about};
+// each value is "everyone" or "nobody". Missing keys default to "everyone".
+function getPrivacy(user) {
+  const def = { lastSeen: 'everyone', photo: 'everyone', about: 'everyone' };
+  if (!user) return def;
+  try {
+    const p = JSON.parse(user.privacy || '{}');
+    return {
+      lastSeen: p.lastSeen === 'nobody' ? 'nobody' : 'everyone',
+      photo: p.photo === 'nobody' ? 'nobody' : 'everyone',
+      about: p.about === 'nobody' ? 'nobody' : 'everyone',
+    };
+  } catch {
+    return def;
+  }
 }
 
 // ---------------------------------------------------------------- email
@@ -571,7 +595,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.1.0' }));
+app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.2.0' }));
 
 // --- accounts -------------------------------------------------------------
 
@@ -718,6 +742,7 @@ function selfProfileHandler(req, res) {
     email: full.email || null,
     verified: Boolean(full.verified),
     online: onlineIds().includes(full.id),
+    privacy: getPrivacy(full),
   });
 }
 app.get('/api/me', selfProfileHandler);
@@ -1063,10 +1088,63 @@ app.post('/api/set-profile', (req, res) => {
 });
 
 // GET /api/profile/:username → public profile + online presence.
+// Honors the target's privacy settings (photo/about/lastSeen); the owner
+// always sees their own full profile. Auth is optional.
 app.get('/api/profile/:username', (req, res) => {
   const u = getUserByUsername(req.params.username);
   if (!u) return res.status(404).json({ error: 'not_found', message: 'No such user.' });
-  res.json(publicProfile(u));
+  const viewer = getUserFromReq(req) || getApiUser(req);
+  res.json(publicProfile(u, viewer));
+});
+
+// POST /api/set-privacy {token, lastSeen?, photo?, about?}
+// Each value: "everyone" | "nobody". Read receipts stay client-side only.
+app.post('/api/set-privacy', (req, res) => {
+  const user = getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
+  const b = req.body || {};
+  const cur = getPrivacy(getUserById(user.id));
+  for (const key of ['lastSeen', 'photo', 'about']) {
+    if (b[key] === undefined) continue;
+    if (b[key] !== 'everyone' && b[key] !== 'nobody') {
+      return res
+        .status(422)
+        .json({ error: 'invalid_privacy', message: 'Privacy values must be "everyone" or "nobody".' });
+    }
+    cur[key] = b[key];
+  }
+  db.prepare('UPDATE users SET privacy = ? WHERE id = ?').run(JSON.stringify(cur), user.id);
+  res.json({ ok: true, privacy: cur });
+});
+
+// POST /api/delete-account {token, password} — permanently deletes the
+// account and all of the user's data (messages, groups, statuses, sessions…).
+app.post('/api/delete-account', (req, res) => {
+  const user = getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
+  const full = getUserById(user.id);
+  if (!full || !verifyPassword(String((req.body && req.body.password) || ''), full.password_hash)) {
+    return res.status(403).json({ error: 'bad_password', message: 'Wrong password.' });
+  }
+  const id = user.id;
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM messages WHERE sender_id = ? OR recipient_id = ?').run(id, id);
+  db.prepare('DELETE FROM group_messages WHERE sender_id = ?').run(id);
+  db.prepare('DELETE FROM group_members WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM groups WHERE creator_id = ?').run(id);
+  db.prepare('DELETE FROM statuses WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM channel_subs WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM channels WHERE creator_id = ?').run(id);
+  for (const row of db.prepare('SELECT id, blocked FROM users').all()) {
+    try {
+      const arr = JSON.parse(row.blocked || '[]').filter((x) => x !== id);
+      db.prepare('UPDATE users SET blocked = ? WHERE id = ?').run(JSON.stringify(arr), row.id);
+    } catch {
+      /* keep going */
+    }
+  }
+  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  res.json({ ok: true });
 });
 
 // --- blocks -----------------------------------------------------------------
@@ -1427,7 +1505,17 @@ app.get('/api/users', requireAuth, (req, res) => {
       "SELECT id, username FROM users WHERE id != ? AND username LIKE ? ESCAPE '\\' ORDER BY username LIMIT 20"
     )
     .all(req.user.id, `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`);
-  res.json({ users: rows });
+  // last_seen is included only when the target's privacy allows it.
+  const users = rows.map((r) => {
+    const u = getUserById(r.id);
+    const priv = getPrivacy(u);
+    return {
+      id: r.id,
+      username: r.username,
+      last_seen: priv.lastSeen !== 'nobody' ? u.last_seen || null : null,
+    };
+  });
+  res.json({ users });
 });
 
 function conversationList(userId) {
@@ -1601,6 +1689,11 @@ wss.on('connection', (ws, req) => {
   if (!online.has(userId)) online.set(userId, new Set());
   online.get(userId).add(ws);
   ws.userId = userId;
+  try {
+    db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').run(Date.now(), userId);
+  } catch {
+    /* non-fatal */
+  }
 
   // Tell everyone this user is now online; send them the current online list.
   broadcast({ type: 'presence', userId, online: true }, userId);
@@ -1782,6 +1875,11 @@ wss.on('connection', (ws, req) => {
       set.delete(ws);
       if (set.size === 0) {
         online.delete(userId);
+        try {
+          db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').run(Date.now(), userId);
+        } catch {
+          /* non-fatal */
+        }
         broadcast({ type: 'presence', userId, online: false });
       }
     }
@@ -1793,7 +1891,7 @@ wss.on('connection', (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.1 listening on port ${PORT} (db: ${DB_PATH})`);
+  console.log(`Chatly v3.2 listening on port ${PORT} (db: ${DB_PATH})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
