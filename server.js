@@ -249,6 +249,14 @@ async function initDb() {
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_channel_posts ON channel_posts(channel_id, id);
+  -- Starred messages (v3.6): per-user bookmarks into DM or group messages.
+  CREATE TABLE IF NOT EXISTS starred_messages (
+    user_id INTEGER NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'dm', -- 'dm' | 'group'
+    message_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, scope, message_id)
+  );
 `);
 }
 
@@ -1791,6 +1799,76 @@ app.post('/api/message-viewed', requireApiUser, ah(async (req, res) => {
     await deliverTo(m.sender_id, req.user.id, { type: 'view_once_viewed', id, scope: 'dm' });
   }
   return res.json({ ok: true });
+}));
+
+// POST /api/star {token, id, scope:'dm'|'group', starred?} — star/unstar a message
+// (default starred=true). Only messages the user can see (their DMs, or groups
+// they belong to) may be starred. — v3.6
+app.post('/api/star', requireApiUser, ah(async (req, res) => {
+  const id = Number(req.body && req.body.id);
+  const scope = req.body && req.body.scope === 'group' ? 'group' : 'dm';
+  const want = !(req.body && req.body.starred === false);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(422).json({ error: 'bad_request', message: 'Message id is required.' });
+  }
+  if (scope === 'group') {
+    const m = await dbGet('SELECT * FROM group_messages WHERE id = ?', [id]);
+    if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+    if (!(await isMember(m.group_id, req.user.id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+  } else {
+    const m = await dbGet('SELECT * FROM messages WHERE id = ?', [id]);
+    if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+    if (m.sender_id !== req.user.id && m.recipient_id !== req.user.id) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
+    }
+  }
+  if (want) {
+    await dbRun(
+      'INSERT OR IGNORE INTO starred_messages (user_id, scope, message_id, created_at) VALUES (?, ?, ?, ?)',
+      [req.user.id, scope, id, Date.now()]
+    );
+  } else {
+    await dbRun(
+      'DELETE FROM starred_messages WHERE user_id = ? AND scope = ? AND message_id = ?',
+      [req.user.id, scope, id]
+    );
+  }
+  res.json({ ok: true, starred: want });
+}));
+
+// GET /api/starred?token= — starred messages with chat context, newest first. — v3.6
+app.get('/api/starred', requireApiUser, ah(async (req, res) => {
+  const rows = await dbAll(
+    'SELECT * FROM starred_messages WHERE user_id = ? ORDER BY created_at DESC LIMIT 200',
+    [req.user.id]
+  );
+  const out = [];
+  for (const s of rows) {
+    if (s.scope === 'group') {
+      const m = await dbGet('SELECT * FROM group_messages WHERE id = ?', [s.message_id]);
+      if (!m || !(await isMember(m.group_id, req.user.id))) continue;
+      const g = await dbGet('SELECT * FROM groups WHERE id = ?', [m.group_id]);
+      const su = await dbGet('SELECT username FROM users WHERE id = ?', [m.sender_id]);
+      const cm = toClientGroupMessage(m, su && su.username);
+      cm.chatName = g ? g.name : 'Group';
+      cm.chatKey = String(m.group_id);
+      cm.chatKind = 'group';
+      out.push(cm);
+    } else {
+      const m = await dbGet('SELECT * FROM messages WHERE id = ?', [s.message_id]);
+      if (!m || (m.sender_id !== req.user.id && m.recipient_id !== req.user.id)) continue;
+      const partnerId = m.sender_id === req.user.id ? m.recipient_id : m.sender_id;
+      const p = await dbGet('SELECT username, display_name FROM users WHERE id = ?', [partnerId]);
+      const cm = toClientMessage(m);
+      cm.chatName = p ? (p.display_name || p.username) : 'Chat';
+      cm.chatKey = String(partnerId);
+      cm.chatKind = 'dm';
+      out.push(cm);
+    }
+  }
+  res.json({ starred: out });
 }));
 
 // --- SPA fallback (API routes above take precedence)
