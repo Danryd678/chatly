@@ -531,7 +531,12 @@ function groupMemberRows(groupId) {
 function groupSummary(groupId) {
   const g = db.prepare('SELECT * FROM groups WHERE id = ?').get(groupId);
   if (!g) return null;
-  return { groupId: g.id, name: g.name, members: groupMemberRows(groupId).map((r) => r.username) };
+  return {
+    groupId: g.id,
+    name: g.name,
+    members: groupMemberRows(groupId).map((r) => r.username),
+    createdAt: Math.floor(g.created_at / 1000),
+  };
 }
 
 // Decoded byte length of a base64 string (Infinity on garbage).
@@ -595,7 +600,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.2.0' }));
+app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.3.0' }));
 
 // --- accounts -------------------------------------------------------------
 
@@ -1292,6 +1297,7 @@ function toClientStatus(s) {
     data: s.data || null,
     bg: s.bg || null,
     ts: s.created_at,
+    createdAt: Math.floor(s.created_at / 1000),
     expireAt: s.expire_at,
   };
 }
@@ -1323,7 +1329,7 @@ app.post('/api/status', requireApiUser, (req, res) => {
       k,
       body,
       payload,
-      typeof bg === 'string' ? bg.slice(0, 40) : null,
+      typeof bg === 'number' ? String(Math.trunc(bg)) : typeof bg === 'string' ? bg.slice(0, 40) : null,
       now,
       now + STATUS_TTL_MS
     );
@@ -1365,19 +1371,27 @@ app.delete('/api/status/:id', requireApiUser, (req, res) => {
 
 // --- channels (broadcast) -----------------------------------------------------
 
-function channelSummary(id) {
+function channelSummary(id, forUserId) {
   const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
   if (!c) return null;
   const creator = getUserById(c.creator_id);
   const subs = db.prepare('SELECT COUNT(*) AS n FROM channel_subs WHERE channel_id = ?').get(id).n;
-  return {
+  const out = {
     channelId: c.id,
+    id: c.id, // alias — some clients read "id"
     name: c.name,
     description: c.description || '',
     subscribers: subs,
     creator: creator ? creator.username : null,
-    createdAt: c.created_at,
+    createdAt: Math.floor(c.created_at / 1000),
   };
+  if (forUserId) {
+    out.mine = c.creator_id === forUserId;
+    out.subscribed = !!db
+      .prepare('SELECT 1 AS x FROM channel_subs WHERE channel_id = ? AND user_id = ?')
+      .get(id, forUserId);
+  }
+  return out;
 }
 
 // POST /api/channels/create {token, name, description?} — creator auto-subscribed.
@@ -1394,10 +1408,12 @@ app.post('/api/channels/create', requireApiUser, (req, res) => {
   res.json({ ok: true, channelId: s.channelId, name: s.name });
 });
 
-// GET /api/channels — public directory with subscriber counts.
+// GET /api/channels?token= — public directory with subscriber counts. When a
+// token is supplied, each row also carries `mine` + `subscribed` for that user.
 app.get('/api/channels', (req, res) => {
+  const user = getApiUser(req);
   const rows = db.prepare('SELECT id FROM channels ORDER BY id DESC LIMIT 200').all();
-  res.json({ channels: rows.map((r) => channelSummary(r.id)).filter(Boolean) });
+  res.json({ channels: rows.map((r) => channelSummary(r.id, user ? user.id : undefined)).filter(Boolean) });
 });
 
 function channelSubHandler(req, res, subscribe) {
@@ -1464,8 +1480,23 @@ app.get('/api/channels/:id/posts', (req, res) => {
       text: p.text,
       data: p.data || null,
       ts: p.created_at,
+      createdAt: Math.floor(p.created_at / 1000),
     })),
   });
+});
+
+// DELETE /api/channels/:id {token} — creator only; wipes posts + subscriptions.
+app.delete('/api/channels/:id', requireApiUser, (req, res) => {
+  const id = Number(req.params.id);
+  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  if (c.creator_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can delete it.' });
+  }
+  db.prepare('DELETE FROM channel_posts WHERE channel_id = ?').run(id);
+  db.prepare('DELETE FROM channel_subs WHERE channel_id = ?').run(id);
+  db.prepare('DELETE FROM channels WHERE id = ?').run(id);
+  res.json({ ok: true });
 });
 
 // --- discover -------------------------------------------------------------------
@@ -1891,7 +1922,7 @@ wss.on('connection', (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.2 listening on port ${PORT} (db: ${DB_PATH})`);
+  console.log(`Chatly v3.3 listening on port ${PORT} (db: ${DB_PATH})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
