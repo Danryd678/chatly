@@ -209,7 +209,8 @@ sender still gets a normal `sent` ack (1:1 messages stay at single-tick).
 - `POST /api/groups/create {token, name, members:[usernames]}`
   → `200 {groupId, name, members:[usernames]}` (creator is always added;
   unknown usernames are skipped).
-- `GET /api/groups?token=` → `200 {groups:[{groupId, name, members}]}`.
+- `GET /api/groups?token=` → `200 {groups:[{groupId, name, members, createdAt}]}`.
+  (`createdAt` is epoch **seconds**, v3.3.)
 - `POST /api/groups/:id/add {token, username}` → `200 {groupId, name, members}`.
   `400 {error:"already_member"}` if already in.
 - `POST /api/groups/:id/remove {token, username}` → `200 {groupId, name, members}`
@@ -229,21 +230,26 @@ Expired statuses (older than 24h) are purged on every read.
   → `200 {ok:true, statusId}`.
   - `kind:"image"` → `data` = base64 ≤ 1 MB decoded, else `413 {error:"too_large"}`.
   - `kind:"text"` requires non-empty `text` (≤ 500 chars).
-  - `bg`: optional background style identifier (≤ 40 chars).
+  - `bg`: optional background style — a string (≤ 40 chars) **or a number**
+    (Android sends the gradient index as an int; stored as its string form).
 - `GET /api/status/feed?token=`
-  → `200 {statuses:[{statusId, username, name, avatar, kind, text, data, bg, ts, expireAt}]}`,
+  → `200 {statuses:[{statusId, username, name, avatar, kind, text, data, bg, ts, createdAt, expireAt}]}`,
   newest first, cap 100. Includes your own. Statuses from users you blocked —
-  or who blocked you — are hidden.
+  or who blocked you — are hidden. `ts`/`expireAt` are epoch **millis**;
+  `createdAt` is epoch **seconds** (v3.3 — for Android relative-time labels).
 - `DELETE /api/status/:id` with `{token}` in the body → `200 {ok:true}`.
   Owner only: `403 {error:"forbidden"}` for others, `404 {error:"not_found"}`
   when missing.
 
-## 5c. Channels (broadcast) — **v3.1**
+## 5c. Channels (broadcast) — **v3.1** (v3.3 additions marked ◆)
 
 - `POST /api/channels/create {token, name, description?}`
   → `200 {ok:true, channelId, name}`. The creator is auto-subscribed.
-- `GET /api/channels` — public directory (no auth needed):
+- `GET /api/channels?token=` — public directory (no auth needed):
   `200 {channels:[{channelId, name, description, subscribers, creator, createdAt}]}`.
+  ◆ Each row also carries `id` (alias of `channelId`). When a valid `token`
+  is supplied, each row additionally carries `mine` (you created it) and
+  `subscribed` (you follow it) for that user. `createdAt` is epoch **seconds**.
 - `POST /api/channels/:id/subscribe {token}` /
   `POST /api/channels/:id/unsubscribe {token}`
   → `200 {ok:true, subscribers}`. `404 {error:"not_found"}` for unknown channels.
@@ -251,7 +257,10 @@ Expired statuses (older than 24h) are purged on every read.
   → `200 {ok:true, postId}`. **Creator only** — others get `403 {error:"forbidden"}`.
   `kind` is `"text"` (default) or `"image"` (base64 ≤ 1 MB, else `413 {error:"too_large"}`).
 - `GET /api/channels/:id/posts?limit=` — public read, newest first, cap 100:
-  `200 {channelId, posts:[{postId, kind, text, data, ts}]}`.
+  `200 {channelId, posts:[{postId, kind, text, data, ts, createdAt}]}`.
+  ◆ `createdAt` is epoch **seconds** (`ts` stays epoch millis).
+- ◆ `DELETE /api/channels/:id` with `{token}` → `200 {ok:true}`. **Creator
+  only** (`403 {error:"forbidden"}` otherwise); cascades to posts + subscriptions.
 
 ## 5d. Discover — **v3.1**
 
