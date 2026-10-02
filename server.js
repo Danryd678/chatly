@@ -681,7 +681,15 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.6.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.7.0' })));
+
+// Public download page (no login needed): Android APK + iPhone web-app guide.
+app.get('/download', (req, res) => res.sendFile(path.join(process.cwd(), 'public', 'download.html')));
+// PWA manifest for the web client.
+app.get('/manifest.webmanifest', (req, res) => {
+  res.type('application/manifest+json');
+  res.sendFile(path.join(process.cwd(), 'public', 'manifest.webmanifest'));
+});
 
 // --- accounts -------------------------------------------------------------
 
@@ -2184,7 +2192,7 @@ wss.on('connection', async (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.6 listening on port ${PORT} (db: ${DB_BACKEND})`);
+  console.log(`Chatly v3.7 listening on port ${PORT} (db: ${DB_BACKEND})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
