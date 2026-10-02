@@ -1,4 +1,4 @@
-# Chatly Server v3.1 — Protocol Reference
+# Chatly Server v3.5 — Protocol Reference
 
 Base URL (production): `https://chatly-4vsww.faable.link`
 WebSocket URL: `wss://chatly-4vsww.faable.link/ws`
@@ -361,6 +361,20 @@ Any message may carry `ttl` (seconds). The server stores
 `expireAt = now + ttl*1000` and excludes expired messages from every history
 endpoint and from offline-delivery queues.
 
+### View-once media — **v3.5**
+Image/voice messages may carry `viewOnce: true` (other kinds ignore it). Stored
+in `messages.view_once` / `group_messages.view_once` (1/0) plus `viewed_at`
+(epoch ms, null until viewed).
+
+- Serialization: every message carries `viewOnce` (bool) and `viewed`
+  (`viewed_at != null`). When a view-once message has been viewed, the `data`
+  field is **omitted** — clients render a placeholder only.
+- `POST /api/message-viewed {token, id, scope}` (`scope`: `"dm"` | `"group"`):
+  only the recipient (DM) or a non-sender member (group) may call it. Sets
+  `viewed_at = now` and wipes `data` to `''` so the media can never be fetched
+  again; pushes `{type:"view_once_viewed", id, scope}` over WS to the sender.
+  Idempotent — returns `{ok:true}`.
+
 ---
 
 ## 8. Server configuration (server owner)
@@ -412,6 +426,8 @@ databases upgrade in place:
 - New: `groups`, `group_members`, `group_messages`.
 - **v3.1:** `users.pending_email`, `users.pending_code`, `users.pending_expiry`;
   new `statuses`, `channels`, `channel_subs`, `channel_posts` tables.
+- **v3.5:** `messages.view_once` (INTEGER 0/1), `messages.viewed_at` (epoch ms);
+  same two columns on `group_messages`.
 
 Auth tokens = rows in the existing `sessions` table (shared by cookie + API).
 

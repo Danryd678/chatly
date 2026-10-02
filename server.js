@@ -165,6 +165,10 @@ async function initDb() {
   await ensureColumn('messages', 'ttl', 'INTEGER'); // disappearing-message TTL in seconds
   await ensureColumn('messages', 'expire_at', 'INTEGER'); // epoch ms; NULL = never expires
 
+// --- v3.5 migrations: view-once media ---------------------------------------
+  await ensureColumn('messages', 'view_once', 'INTEGER NOT NULL DEFAULT 0'); // 1 = view-once image/voice
+  await ensureColumn('messages', 'viewed_at', 'INTEGER'); // epoch ms when the recipient viewed it
+
 // --- v3.0: groups ----------------------------------------------------------
   await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS groups (
@@ -194,6 +198,9 @@ async function initDb() {
   CREATE INDEX IF NOT EXISTS idx_group_messages ON group_messages(group_id, id);
   CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
 `);
+  // --- v3.5: view-once columns on group_messages (table now exists) -----------
+  await ensureColumn('group_messages', 'view_once', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('group_messages', 'viewed_at', 'INTEGER');
 
 // --- v3.1 migrations: pending email changes --------------------------------
   await ensureColumn('users', 'pending_email', 'TEXT'); // new address awaiting verification
@@ -499,12 +506,12 @@ function logMailError(where, err) {
 
 // ---------------------------------------------------------------- messages
 
-async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null }) {
+async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
   const info = await dbRun(
-    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)',
-    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt]
+    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at, view_once) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)',
+    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt, viewOnce ? 1 : 0]
   );
   return (await dbGet('SELECT * FROM messages WHERE id = ?', [info.lastInsertRowid]));
 }
@@ -519,7 +526,9 @@ function parseReactions(json) {
 }
 
 function toClientMessage(m) {
-  return {
+  const viewOnce = !!m.view_once;
+  const viewed = m.viewed_at != null;
+  const o = {
     id: m.id,
     senderId: m.sender_id,
     kind: m.kind || 'text',
@@ -531,21 +540,27 @@ function toClientMessage(m) {
     expireAt: m.expire_at || null,
     status: m.status,
     createdAt: m.created_at,
+    viewOnce,
+    viewed,
   };
+  if (viewOnce && viewed) delete o.data; // placeholder only — the media is gone for good
+  return o;
 }
 
-async function insertGroupMessage(groupId, senderId, { kind = 'text', body = '', data = null, mime = null, ttl = null }) {
+async function insertGroupMessage(groupId, senderId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
   const info = await dbRun(
-    'INSERT INTO group_messages (group_id, sender_id, kind, body, data, mime, ttl, expire_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [groupId, senderId, kind, body, data, mime, ttl, expireAt, now]
+    'INSERT INTO group_messages (group_id, sender_id, kind, body, data, mime, ttl, expire_at, created_at, view_once) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [groupId, senderId, kind, body, data, mime, ttl, expireAt, now, viewOnce ? 1 : 0]
   );
   return (await dbGet('SELECT * FROM group_messages WHERE id = ?', [info.lastInsertRowid]));
 }
 
 function toClientGroupMessage(m, senderUsername) {
-  return {
+  const viewOnce = !!m.view_once;
+  const viewed = m.viewed_at != null;
+  const o = {
     id: m.id,
     groupId: m.group_id,
     senderId: m.sender_id,
@@ -558,7 +573,11 @@ function toClientGroupMessage(m, senderUsername) {
     ttl: m.ttl || null,
     expireAt: m.expire_at || null,
     createdAt: m.created_at,
+    viewOnce,
+    viewed,
   };
+  if (viewOnce && viewed) delete o.data; // placeholder only — the media is gone for good
+  return o;
 }
 
 async function isMember(groupId, userId) {
@@ -633,7 +652,9 @@ function parseRichContent(msg) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
     data = JSON.stringify({ lat, lng });
   }
-  return { kind, body, data, mime, ttl };
+  // View-once: only for image/voice notes, explicit opt-in from the sender.
+  const viewOnce = (kind === 'image' || kind === 'audio') && msg.viewOnce === true;
+  return { kind, body, data, mime, ttl, viewOnce };
 }
 
 // ---------------------------------------------------------------- express app
@@ -652,7 +673,7 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.4.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.5.0' })));
 
 // --- accounts -------------------------------------------------------------
 
@@ -1709,6 +1730,42 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
   });
 }));
 
+// POST /api/message-viewed {token, id, scope} — mark a view-once message as
+// viewed. Only the recipient (DM) or a non-sender member (group) may do this.
+// Wipes the media bytes so they can never be fetched again, and pushes a WS
+// event to the sender so their row flips to "Opened". Idempotent.
+app.post('/api/message-viewed', requireApiUser, ah(async (req, res) => {
+  const id = Number(req.body && req.body.id);
+  const scope = req.body && req.body.scope === 'group' ? 'group' : 'dm';
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(422).json({ error: 'bad_request', message: 'Message id is required.' });
+  }
+  if (scope === 'group') {
+    const m = await dbGet('SELECT * FROM group_messages WHERE id = ?', [id]);
+    if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+    if (!(await isMember(m.group_id, req.user.id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+    if (m.sender_id === req.user.id || !m.view_once) return res.json({ ok: true });
+    if (m.viewed_at == null) {
+      await dbRun('UPDATE group_messages SET viewed_at = ?, data = ? WHERE id = ?', [Date.now(), '', id]);
+      await deliverTo(m.sender_id, req.user.id, { type: 'view_once_viewed', id, scope: 'group' });
+    }
+    return res.json({ ok: true });
+  }
+  const m = await dbGet('SELECT * FROM messages WHERE id = ?', [id]);
+  if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+  if (m.sender_id !== req.user.id && m.recipient_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
+  }
+  if (m.recipient_id !== req.user.id || !m.view_once) return res.json({ ok: true });
+  if (m.viewed_at == null) {
+    await dbRun('UPDATE messages SET viewed_at = ?, data = ? WHERE id = ?', [Date.now(), '', id]);
+    await deliverTo(m.sender_id, req.user.id, { type: 'view_once_viewed', id, scope: 'dm' });
+  }
+  return res.json({ ok: true });
+}));
+
 // --- SPA fallback (API routes above take precedence)
 app.get('*', ah(async (req, res, next) => {
   if (req.path.startsWith('/api/') || req.path === '/ws') return next();
@@ -2003,7 +2060,7 @@ wss.on('connection', async (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.4 listening on port ${PORT} (db: ${DB_BACKEND})`);
+  console.log(`Chatly v3.5 listening on port ${PORT} (db: ${DB_BACKEND})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
