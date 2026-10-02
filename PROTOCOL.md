@@ -50,8 +50,8 @@ Body: `{ "username", "password", "email"? }`
 
 ### POST /api/login
 Body: `{ "username", "password" }` **or** `{ "login", "password" }` — `login`
-accepts a **username or an email address**. → `200 {ok:true, token, username, user:{id,username}}`
-(also sets the cookie for the web UI).
+accepts a **username or an email address**. → `200 {ok:true, token, username, id, user:{id,username}}`
+(also sets the cookie for the web UI). Top-level `id` added in v3.6 (Android reads it for message alignment).
 
 - `401 {error:"bad_credentials"}` — wrong username/email or password.
 - `403 {error:"not_verified"}` — account exists but email not verified yet.
@@ -219,6 +219,8 @@ sender still gets a normal `sent` ack (1:1 messages stay at single-tick).
 - `GET /api/groups/:id/history?token=&limit=50`
   → `200 {groupId, messages:[...]}` — newest `limit` (max 100), oldest→newest.
   Expired messages are excluded; messages from senders you blocked are hidden.
+  `after=<id>` (v3.6): only messages with `id > after`, oldest→newest — for the
+  client's incremental fallback poll when the WebSocket drops.
 
 ---
 
@@ -233,10 +235,11 @@ Expired statuses (older than 24h) are purged on every read.
   - `bg`: optional background style — a string (≤ 40 chars) **or a number**
     (Android sends the gradient index as an int; stored as its string form).
 - `GET /api/status/feed?token=`
-  → `200 {statuses:[{statusId, username, name, avatar, kind, text, data, bg, ts, createdAt, expireAt}]}`,
+  → `200 {statuses:[{statusId, userId, username, name, avatar, kind, text, data, bg, ts, createdAt, expireAt}]}`,
   newest first, cap 100. Includes your own. Statuses from users you blocked —
   or who blocked you — are hidden. `ts`/`expireAt` are epoch **millis**;
   `createdAt` is epoch **seconds** (v3.3 — for Android relative-time labels).
+  `userId` added in v3.6 (lets clients reliably tell own vs others' statuses).
 - `DELETE /api/status/:id` with `{token}` in the body → `200 {ok:true}`.
   Owner only: `403 {error:"forbidden"}` for others, `404 {error:"not_found"}`
   when missing.
@@ -277,6 +280,8 @@ Expired statuses (older than 24h) are purged on every read.
 - `GET /api/chats` — conversation list with last message + unread counts.
 - `GET /api/messages/:partnerId?before=&limit=` — history (expired messages
   excluded); opening the latest view marks messages read (as before).
+  `after=<id>` (v3.6): only messages with `id > after`, oldest→newest — for the
+  client's incremental fallback poll when the WebSocket drops.
 
 **Message object** (REST + WebSocket):
 
@@ -323,6 +328,23 @@ Connect: `ws(s)://host/ws` with the session cookie, or `?token=...`.
 - `{type:"typing", to, typing}` — `to` accepts id or username.
 
 ### Reactions — **v3**
+
+### Reconnect catch-up — **v3.6**
+When a client connects (or reconnects) over WebSocket, the server pushes every
+undelivered message (`status = 0`, cap 50, oldest first) as a normal
+`{type:"message", from, fromName, message}` event — block-aware — before marking
+them delivered. Previously only receipts were sent and the bodies never reached
+a client whose socket had silently died; clients also run a 15s incremental
+HTTP poll (`after=`) as a fallback while a chat is open.
+
+### Starred messages — **v3.6**
+Per-user bookmarks into DM or group messages.
+- `POST /api/star {token, id, scope:"dm"|"group", starred?}` → `200 {ok:true, starred}`.
+  Defaults to starring; `starred:false` removes. `404` if the message doesn't
+  exist; `403` if it isn't visible to the caller (not their DM / not a member).
+- `GET /api/starred?token=` → `200 {starred:[...]}` newest first (cap 200).
+  Each entry is the client message object plus `chatKind` (`"dm"|"group"`),
+  `chatKey` (partner id or group id, as string) and `chatName`.
 - Client → server: `{type:"reaction", to, from, msgId, emoji}`
   (`to`: username or user id). Toggles your reaction; persisted on the message.
 - Server → target: `{type:"reaction", from:username, msgId, emoji, reactions}`

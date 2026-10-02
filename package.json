@@ -14,5 +14,5 @@
     "test": "node test/test.mjs"
   },
   "type": "module",
-  "version": "3.5.0"
+  "version": "3.7.0"
 }
