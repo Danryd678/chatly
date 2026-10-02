@@ -1,13 +1,22 @@
 /**
- * Chatly server v3.1 — real-time messenger.
+ * Chatly server v3.4 — real-time messenger.
  *
- * Stack: Node.js + Express + WebSocket (ws) + SQLite (node:sqlite, built in)
+ * Stack: Node.js + Express + WebSocket (ws) + SQLite via libsql
  *        + nodemailer (SMTP email for verification / password reset).
- * No native modules, no build step. SQLite file keeps everything persistent.
+ * No native modules, no build step.
+ *
+ * Database backend (env):
+ *   TURSO_URL         — Turso (hosted SQLite) database URL, e.g.
+ *                       libsql://chatly-xxxx.turso.io  (production on Faable)
+ *   TURSO_AUTH_TOKEN  — Turso auth token for TURSO_URL
+ *   DB_PATH           — local SQLite file path, used ONLY when TURSO_URL is
+ *                       unset (dev + tests; default ./data/chatly.db)
+ * Faable's disk is ephemeral, so production MUST set TURSO_URL or all data
+ * is wiped on every restart/deploy.
  *
  * Config (env vars):
  *   PORT       — port to listen on (default 3000)
- *   DB_PATH    — SQLite file path (default ./data/chatly.db)
+ *   DB_PATH    — SQLite file path (default ./data/chatly.db, file mode only)
  *   SMTP_HOST  — SMTP server hostname (required for any email sending)
  *   SMTP_PORT  — SMTP port (default 587)
  *   SMTP_USER  — SMTP username (required for any email sending)
@@ -28,7 +37,7 @@
 import express from 'express';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
-import { DatabaseSync } from 'node:sqlite';
+import { createClient } from '@libsql/client';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -66,19 +75,49 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 // page. Clients read the JSON `error` field, never the status code.
 
 // ---------------------------------------------------------------- database
+// Backend: Turso (hosted SQLite) when TURSO_URL is set, otherwise a local
+// SQLite file (dev + tests). Same SQL dialect either way.
 
-mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
+const TURSO_URL = process.env.TURSO_URL || '';
+const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN || '';
+if (!TURSO_URL) mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = TURSO_URL
+  ? createClient({ url: TURSO_URL, authToken: TURSO_AUTH_TOKEN || undefined })
+  : createClient({ url: 'file:' + DB_PATH });
+const DB_BACKEND = TURSO_URL ? 'turso' : 'file:' + DB_PATH;
+
+// Thin async wrappers over libsql's db.execute. Rows come back as objects,
+// so these mirror the old sync API: dbGet → row|undefined, dbAll → rows[],
+// dbRun → result ({rowsAffected, lastInsertRowid}).
+async function dbGet(sql, args = []) {
+  const r = await db.execute({ sql, args });
+  return r.rows.length ? r.rows[0] : undefined;
+}
+async function dbAll(sql, args = []) {
+  const r = await db.execute({ sql, args });
+  return r.rows;
+}
+async function dbRun(sql, args = []) {
+  return db.execute({ sql, args });
+}
 
 // Add a column only if it does not exist yet (safe to run on every boot,
 // so old databases migrate forward automatically).
-function ensureColumn(table, col, ddl) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-  if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+async function ensureColumn(table, col, ddl) {
+  const cols = (await dbAll(`PRAGMA table_info(${table})`)).map((c) => c.name);
+  if (!cols.includes(col)) await db.execute(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
 }
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
+async function initDb() {
+  // WAL only makes sense for a local file; Turso manages its own storage.
+  if (!TURSO_URL) {
+    try {
+      await db.execute('PRAGMA journal_mode = WAL');
+    } catch {
+      /* non-fatal */
+    }
+  }
+  await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
@@ -104,30 +143,30 @@ db.exec(`
 `);
 
 // --- v3.0 migrations: email + verification on users ----------------------
-ensureColumn('users', 'email', 'TEXT'); // UNIQUE index created below
-ensureColumn('users', 'verified', 'INTEGER NOT NULL DEFAULT 1'); // legacy accounts grandfathered
-ensureColumn('users', 'verify_code', 'TEXT');
-ensureColumn('users', 'verify_expiry', 'INTEGER');
-ensureColumn('users', 'reset_code', 'TEXT');
-ensureColumn('users', 'reset_expiry', 'INTEGER');
-ensureColumn('users', 'display_name', 'TEXT');
-ensureColumn('users', 'bio', 'TEXT');
-ensureColumn('users', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
-ensureColumn('users', 'blocked', "TEXT NOT NULL DEFAULT '[]'"); // JSON array of user ids
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
+  await ensureColumn('users', 'email', 'TEXT'); // UNIQUE index created below
+  await ensureColumn('users', 'verified', 'INTEGER NOT NULL DEFAULT 1'); // legacy accounts grandfathered
+  await ensureColumn('users', 'verify_code', 'TEXT');
+  await ensureColumn('users', 'verify_expiry', 'INTEGER');
+  await ensureColumn('users', 'reset_code', 'TEXT');
+  await ensureColumn('users', 'reset_expiry', 'INTEGER');
+  await ensureColumn('users', 'display_name', 'TEXT');
+  await ensureColumn('users', 'bio', 'TEXT');
+  await ensureColumn('users', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
+  await ensureColumn('users', 'blocked', "TEXT NOT NULL DEFAULT '[]'"); // JSON array of user ids
+  await db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
 // SQLite allows many NULLs in a UNIQUE index, so legacy accounts without an
 // email coexist fine.
 
 // --- v3.0 migrations: rich message fields ---------------------------------
-ensureColumn('messages', 'kind', "TEXT NOT NULL DEFAULT 'text'"); // text|image|audio|location
-ensureColumn('messages', 'data', 'TEXT'); // base64 payload or JSON (location)
-ensureColumn('messages', 'mime', 'TEXT'); // e.g. image/jpeg
-ensureColumn('messages', 'reactions', "TEXT NOT NULL DEFAULT '{}'"); // {"❤️":["alice"]}
-ensureColumn('messages', 'ttl', 'INTEGER'); // disappearing-message TTL in seconds
-ensureColumn('messages', 'expire_at', 'INTEGER'); // epoch ms; NULL = never expires
+  await ensureColumn('messages', 'kind', "TEXT NOT NULL DEFAULT 'text'"); // text|image|audio|location
+  await ensureColumn('messages', 'data', 'TEXT'); // base64 payload or JSON (location)
+  await ensureColumn('messages', 'mime', 'TEXT'); // e.g. image/jpeg
+  await ensureColumn('messages', 'reactions', "TEXT NOT NULL DEFAULT '{}'"); // {"❤️":["alice"]}
+  await ensureColumn('messages', 'ttl', 'INTEGER'); // disappearing-message TTL in seconds
+  await ensureColumn('messages', 'expire_at', 'INTEGER'); // epoch ms; NULL = never expires
 
 // --- v3.0: groups ----------------------------------------------------------
-db.exec(`
+  await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -157,16 +196,16 @@ db.exec(`
 `);
 
 // --- v3.1 migrations: pending email changes --------------------------------
-ensureColumn('users', 'pending_email', 'TEXT'); // new address awaiting verification
-ensureColumn('users', 'pending_code', 'TEXT');
-ensureColumn('users', 'pending_expiry', 'INTEGER');
+  await ensureColumn('users', 'pending_email', 'TEXT'); // new address awaiting verification
+  await ensureColumn('users', 'pending_code', 'TEXT');
+  await ensureColumn('users', 'pending_expiry', 'INTEGER');
 
 // --- v3.2 migrations: privacy settings + last seen --------------------------
-ensureColumn('users', 'privacy', "TEXT NOT NULL DEFAULT '{}'"); // JSON: {lastSeen,photo,about} each "everyone"|"nobody"
-ensureColumn('users', 'last_seen', 'INTEGER'); // epoch ms of last activity (WS connect/disconnect)
+  await ensureColumn('users', 'privacy', "TEXT NOT NULL DEFAULT '{}'"); // JSON: {lastSeen,photo,about} each "everyone"|"nobody"
+  await ensureColumn('users', 'last_seen', 'INTEGER'); // epoch ms of last activity (WS connect/disconnect)
 
 // --- v3.1: statuses (24h stories) -------------------------------------------
-db.exec(`
+  await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS statuses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -181,7 +220,7 @@ db.exec(`
 `);
 
 // --- v3.1: broadcast channels ------------------------------------------------
-db.exec(`
+  await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -204,6 +243,9 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_channel_posts ON channel_posts(channel_id, id);
 `);
+}
+
+await initDb();
 
 // ---------------------------------------------------------------- auth helpers
 
@@ -225,24 +267,22 @@ function genCode() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
 }
 
-function newSession(userId) {
-  db.prepare('DELETE FROM sessions WHERE user_id = ? AND expires_at < ?').run(userId, Date.now());
+async function newSession(userId) {
+  (await dbRun('DELETE FROM sessions WHERE user_id = ? AND expires_at < ?', [userId, Date.now()]));
   const token = randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
-    .run(token, userId, Date.now() + SESSION_TTL_MS);
+  (await dbRun('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)', [token, userId, Date.now() + SESSION_TTL_MS]));
   return token;
 }
 
-function apiUserFromToken(token) {
+async function apiUserFromToken(token) {
   if (typeof token !== 'string' || !token) return null;
-  const row = db
-    .prepare(
-      'SELECT s.user_id, u.username, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'
-    )
-    .get(token);
+  const row = await dbGet(
+    'SELECT s.user_id, u.username, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
+    [token]
+  );
   if (!row) return null;
   if (row.expires_at < Date.now()) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    (await dbRun('DELETE FROM sessions WHERE token = ?', [token]));
     return null;
   }
   return { id: row.user_id, username: row.username, sessionToken: token };
@@ -257,30 +297,30 @@ function parseCookies(header) {
   return out;
 }
 
-function getUserFromReq(req) {
+async function getUserFromReq(req) {
   const cookies = parseCookies(req.headers.cookie);
-  return apiUserFromToken(cookies[SESSION_COOKIE]);
+  return await apiUserFromToken(cookies[SESSION_COOKIE]);
 }
 
 // Token for the JSON API: body field, query string, or Bearer header.
-function getApiUser(req) {
+async function getApiUser(req) {
   const b = req.body || {};
   let token = b.token || req.query.token;
   const auth = req.headers.authorization;
   if (!token && typeof auth === 'string' && auth.startsWith('Bearer ')) {
     token = auth.slice(7);
   }
-  return token ? apiUserFromToken(String(token)) : null;
+  return token ? await apiUserFromToken(String(token)) : null;
 }
 
 // WebSocket handshake: cookie first (web UI), then ?token= (Android).
-function getUserFromWs(req) {
-  const viaCookie = getUserFromReq(req);
+async function getUserFromWs(req) {
+  const viaCookie = await getUserFromReq(req);
   if (viaCookie) return viaCookie;
   try {
     const url = new URL(req.url || '/', 'http://localhost');
     const token = url.searchParams.get('token');
-    if (token) return apiUserFromToken(token);
+    if (token) return await apiUserFromToken(token);
   } catch {
     /* ignore */
   }
@@ -308,7 +348,7 @@ function clearSessionCookie(res) {
 // Simple in-memory rate limiter (per IP per endpoint label).
 const rateBuckets = new Map();
 function rateLimit(label, maxPerMinute) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const key = `${label}:${req.ip}`;
     const now = Date.now();
     let bucket = rateBuckets.get(key);
@@ -322,33 +362,41 @@ function rateLimit(label, maxPerMinute) {
   };
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   // Web UI: HttpOnly session cookie. API/Android: token via body/query/Bearer.
-  const user = getUserFromReq(req) || getApiUser(req);
-  if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
-  req.user = user;
-  next();
+  try {
+    const user = (await getUserFromReq(req)) || (await getApiUser(req));
+    if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
+    req.user = user;
+    next();
+  } catch (e) {
+    next(e);
+  }
 }
 
-function requireApiUser(req, res, next) {
-  const user = getApiUser(req);
-  if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired token.' });
-  req.user = user;
-  next();
+async function requireApiUser(req, res, next) {
+  try {
+    const user = await getApiUser(req);
+    if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired token.' });
+    req.user = user;
+    next();
+  } catch (e) {
+    next(e);
+  }
 }
 
 // ---------------------------------------------------------------- user helpers
 
-const getUserById = (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-const getUserByUsername = (name) =>
-  db.prepare('SELECT * FROM users WHERE username = ?').get(String(name || '').trim());
-const getUserByEmail = (email) =>
-  db.prepare('SELECT * FROM users WHERE email = ?').get(String(email || '').trim().toLowerCase());
+const getUserById = async (id) => (await dbGet('SELECT * FROM users WHERE id = ?', [id]));
+const getUserByUsername = async (name) =>
+  (await dbGet('SELECT * FROM users WHERE username = ?', [String(name || '').trim()]));
+const getUserByEmail = async (email) =>
+  (await dbGet('SELECT * FROM users WHERE email = ?', [String(email || '').trim().toLowerCase()]));
 
 const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
 
-function blockedIds(userId) {
-  const row = db.prepare('SELECT blocked FROM users WHERE id = ?').get(userId);
+async function blockedIds(userId) {
+  const row = (await dbGet('SELECT blocked FROM users WHERE id = ?', [userId]));
   try {
     const arr = JSON.parse(row?.blocked || '[]');
     return new Set(Array.isArray(arr) ? arr : []);
@@ -357,24 +405,25 @@ function blockedIds(userId) {
   }
 }
 
-function isBlocked(recipientId, senderId) {
-  return blockedIds(recipientId).has(senderId);
+async function isBlocked(recipientId, senderId) {
+  return (await blockedIds(recipientId)).has(senderId);
 }
 
-function blockedUsernames(userId) {
-  const ids = [...blockedIds(userId)];
+async function blockedUsernames(userId) {
+  const ids = [...(await blockedIds(userId))];
   if (!ids.length) return [];
-  const rows = db
-    .prepare(`SELECT username FROM users WHERE id IN (${ids.map(() => '?').join(',')})`)
-    .all(...ids);
+  const rows = await dbAll(
+    `SELECT username FROM users WHERE id IN (${ids.map(() => '?').join(',')})`,
+    [...ids]
+  );
   return rows.map((r) => r.username);
 }
 
-function setBlockedIds(userId, ids) {
-  db.prepare('UPDATE users SET blocked = ? WHERE id = ?').run(JSON.stringify([...ids]), userId);
+async function setBlockedIds(userId, ids) {
+  (await dbRun('UPDATE users SET blocked = ? WHERE id = ?', [JSON.stringify([...ids]), userId]));
 }
 
-function publicProfile(user, viewer) {
+async function publicProfile(user, viewer) {
   const priv = getPrivacy(user);
   const isOwner = viewer && viewer.id === user.id;
   return {
@@ -450,15 +499,14 @@ function logMailError(where, err) {
 
 // ---------------------------------------------------------------- messages
 
-function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null }) {
+async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
-  const info = db
-    .prepare(
-      'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)'
-    )
-    .run(senderId, recipientId, body, now, kind, data, mime, ttl, expireAt);
-  return db.prepare('SELECT * FROM messages WHERE id = ?').get(info.lastInsertRowid);
+  const info = await dbRun(
+    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)',
+    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt]
+  );
+  return (await dbGet('SELECT * FROM messages WHERE id = ?', [info.lastInsertRowid]));
 }
 
 function parseReactions(json) {
@@ -486,15 +534,14 @@ function toClientMessage(m) {
   };
 }
 
-function insertGroupMessage(groupId, senderId, { kind = 'text', body = '', data = null, mime = null, ttl = null }) {
+async function insertGroupMessage(groupId, senderId, { kind = 'text', body = '', data = null, mime = null, ttl = null }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
-  const info = db
-    .prepare(
-      'INSERT INTO group_messages (group_id, sender_id, kind, body, data, mime, ttl, expire_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    )
-    .run(groupId, senderId, kind, body, data, mime, ttl, expireAt, now);
-  return db.prepare('SELECT * FROM group_messages WHERE id = ?').get(info.lastInsertRowid);
+  const info = await dbRun(
+    'INSERT INTO group_messages (group_id, sender_id, kind, body, data, mime, ttl, expire_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [groupId, senderId, kind, body, data, mime, ttl, expireAt, now]
+  );
+  return (await dbGet('SELECT * FROM group_messages WHERE id = ?', [info.lastInsertRowid]));
 }
 
 function toClientGroupMessage(m, senderUsername) {
@@ -514,27 +561,26 @@ function toClientGroupMessage(m, senderUsername) {
   };
 }
 
-function isMember(groupId, userId) {
+async function isMember(groupId, userId) {
   return Boolean(
-    db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?').get(groupId, userId)
+    (await dbGet('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?', [groupId, userId]))
   );
 }
 
-function groupMemberRows(groupId) {
-  return db
-    .prepare(
-      'SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = ? ORDER BY u.username'
-    )
-    .all(groupId);
+async function groupMemberRows(groupId) {
+  return dbAll(
+    'SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = ? ORDER BY u.username',
+    [groupId]
+  );
 }
 
-function groupSummary(groupId) {
-  const g = db.prepare('SELECT * FROM groups WHERE id = ?').get(groupId);
+async function groupSummary(groupId) {
+  const g = (await dbGet('SELECT * FROM groups WHERE id = ?', [groupId]));
   if (!g) return null;
   return {
     groupId: g.id,
     name: g.name,
-    members: groupMemberRows(groupId).map((r) => r.username),
+    members: (await groupMemberRows(groupId)).map((r) => r.username),
     createdAt: Math.floor(g.created_at / 1000),
   };
 }
@@ -593,6 +639,12 @@ function parseRichContent(msg) {
 // ---------------------------------------------------------------- express app
 
 const app = express();
+// Async route-handler wrapper: Express 4 does not catch rejections from
+// async handlers, so funnel them into the error middleware (JSON 422, never
+// 5xx — the hosting edge proxy swallows 5xx responses).
+const ah = (fn) => async (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
 // Global JSON limit sized for the largest legitimate payload (1MB media for
 // statuses/channel posts, base64-inflated); each handler enforces its own
 // tighter cap with a JSON 413. Anything beyond this → JSON 413 via the error
@@ -600,7 +652,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.3.0' }));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.4.0' })));
 
 // --- accounts -------------------------------------------------------------
 
@@ -609,7 +661,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Chatly', version
 //                    6-digit code (10 min). 503 if SMTP is not configured.
 //  - Without email → legacy web flow: creates a verified account and logs in
 //                    (cookie), exactly like v1/v2 did.
-app.post('/api/register', rateLimit('register', 10), async (req, res) => {
+app.post('/api/register', rateLimit('register', 10), ah(async (req, res) => {
   const { username, password, email } = req.body || {};
   if (typeof username !== 'string' || !USERNAME_RE.test(username.trim())) {
     return res
@@ -622,23 +674,22 @@ app.post('/api/register', rateLimit('register', 10), async (req, res) => {
       .json({ error: 'weak_password', message: 'Password must be at least 6 characters.' });
   }
   const name = username.trim();
-  if (getUserByUsername(name)) {
+  if (await getUserByUsername(name)) {
     return res.status(409).json({ error: 'username_taken', message: 'That username is taken.' });
   }
 
   // ---- legacy flow (web UI): no email supplied -------------------------
   if (email == null || String(email).trim() === '') {
     try {
-      db.prepare('INSERT INTO users (username, password_hash, created_at, verified) VALUES (?, ?, ?, 1)')
-        .run(name, hashPassword(password), Date.now());
+      (await dbRun('INSERT INTO users (username, password_hash, created_at, verified) VALUES (?, ?, ?, 1)', [name, hashPassword(password), Date.now()]));
     } catch (e) {
       if (String(e.message).includes('UNIQUE')) {
         return res.status(409).json({ error: 'username_taken', message: 'That username is taken.' });
       }
       throw e;
     }
-    const user = getUserByUsername(name);
-    const token = newSession(user.id);
+    const user = await getUserByUsername(name);
+    const token = await newSession(user.id);
     setSessionCookie(res, token);
     return res.json({ ok: true, user: { id: user.id, username: user.username } });
   }
@@ -648,7 +699,7 @@ app.post('/api/register', rateLimit('register', 10), async (req, res) => {
   if (!EMAIL_RE.test(mail)) {
     return res.status(400).json({ error: 'invalid_email', message: 'That email address looks invalid.' });
   }
-  if (getUserByEmail(mail)) {
+  if (await getUserByEmail(mail)) {
     return res.status(409).json({ error: 'email_taken', message: 'That email is already registered.' });
   }
   if (!smtpConfigured()) {
@@ -660,9 +711,10 @@ app.post('/api/register', rateLimit('register', 10), async (req, res) => {
   }
   const code = genCode();
   try {
-    db.prepare(
-      'INSERT INTO users (username, password_hash, created_at, email, verified, verify_code, verify_expiry) VALUES (?, ?, ?, ?, 0, ?, ?)'
-    ).run(name, hashPassword(password), Date.now(), mail, code, Date.now() + CODE_TTL_MS);
+    await dbRun(
+      'INSERT INTO users (username, password_hash, created_at, email, verified, verify_code, verify_expiry) VALUES (?, ?, ?, ?, 0, ?, ?)',
+      [name, hashPassword(password), Date.now(), mail, code, Date.now() + CODE_TTL_MS]
+    );
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {
       return res.status(409).json({ error: 'username_taken', message: 'That username is taken.' });
@@ -685,12 +737,12 @@ app.post('/api/register', rateLimit('register', 10), async (req, res) => {
     });
   }
   res.json({ ok: true, email: mail, message: 'Verification code sent. Check your inbox.' });
-});
+}));
 
 // POST /api/login {username|login, password} — `login` may be a username OR an
 // email address. {token, username} on success, cookie set for the web UI.
 // Legacy cookie flow keeps working; unverified accounts get 403.
-app.post('/api/login', rateLimit('login', 20), (req, res) => {
+app.post('/api/login', rateLimit('login', 20), ah(async (req, res) => {
   const { username, login, password } = req.body || {};
   const ident =
     typeof login === 'string' && login.trim()
@@ -701,7 +753,7 @@ app.post('/api/login', rateLimit('login', 20), (req, res) => {
   if (!ident || typeof password !== 'string') {
     return res.status(400).json({ error: 'bad_request', message: 'Username/email and password required.' });
   }
-  const row = getUserByUsername(ident) || getUserByEmail(ident);
+  const row = await getUserByUsername(ident) || await getUserByEmail(ident);
   if (!row || !verifyPassword(password, row.password_hash)) {
     return res.status(401).json({ error: 'bad_credentials', message: 'Wrong username or password.' });
   }
@@ -710,7 +762,7 @@ app.post('/api/login', rateLimit('login', 20), (req, res) => {
       .status(403)
       .json({ error: 'not_verified', message: 'Please verify your email address first.' });
   }
-  const token = newSession(row.id);
+  const token = await newSession(row.id);
   setSessionCookie(res, token);
   res.json({
     ok: true,
@@ -718,26 +770,26 @@ app.post('/api/login', rateLimit('login', 20), (req, res) => {
     username: row.username,
     user: { id: row.id, username: row.username },
   });
-});
+}));
 
-app.post('/api/logout', (req, res, next) => {
-  req.user = getUserFromReq(req) || getApiUser(req);
+app.post('/api/logout', ah(async (req, res, next) => {
+  req.user = await getUserFromReq(req) || await getApiUser(req);
   next();
-}, (req, res) => {
+}), ah(async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
-  db.prepare('DELETE FROM sessions WHERE token = ?').run(req.user.sessionToken);
+  (await dbRun('DELETE FROM sessions WHERE token = ?', [req.user.sessionToken]));
   clearSessionCookie(res);
   res.json({ ok: true });
-});
+}));
 
 // GET /api/me?token= and POST /api/me {token} → full self profile.
 // Legacy {user:{id,username}} shape is preserved inside; the top level adds
 // the profile fields the app needs. Public /api/profile/:username deliberately
 // omits email/verified.
-function selfProfileHandler(req, res) {
-  const user = getUserFromReq(req) || getApiUser(req);
+async function selfProfileHandler(req, res) {
+  const user = await getUserFromReq(req) || await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
-  const full = getUserById(user.id);
+  const full = await getUserById(user.id);
   res.json({
     user: { id: full.id, username: full.username },
     username: full.username,
@@ -750,15 +802,15 @@ function selfProfileHandler(req, res) {
     privacy: getPrivacy(full),
   });
 }
-app.get('/api/me', selfProfileHandler);
-app.post('/api/me', selfProfileHandler);
+app.get('/api/me', ah(selfProfileHandler));
+app.post('/api/me', ah(selfProfileHandler));
 
 // POST /api/auth/google {idToken, username?} — Google sign-in.
 // Verifies the ID token with Google, requires aud == GOOGLE_CLIENT_ID and
 // email_verified. Find-or-create by email; new users get a unique username
 // (requested one if valid+free, else derived from the email prefix).
 // 503 {error:"google_not_configured"} when GOOGLE_CLIENT_ID is missing.
-app.post('/api/auth/google', rateLimit('google', 20), async (req, res) => {
+app.post('/api/auth/google', rateLimit('google', 20), ah(async (req, res) => {
   if (!GOOGLE_CLIENT_ID) {
     return res.status(422).json({
       error: 'google_not_configured',
@@ -793,40 +845,41 @@ app.post('/api/auth/google', rateLimit('google', 20), async (req, res) => {
   if (!EMAIL_RE.test(email)) {
     return res.status(400).json({ error: 'invalid_email', message: 'Google returned an invalid email.' });
   }
-  let user = getUserByEmail(email);
+  let user = await getUserByEmail(email);
   if (!user) {
     let name = String(username || '').trim();
-    if (!name || !USERNAME_RE.test(name) || getUserByUsername(name)) name = '';
+    if (!name || !USERNAME_RE.test(name) || await getUserByUsername(name)) name = '';
     if (!name) {
       let base = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20) || 'user';
       if (!USERNAME_RE.test(base)) base = 'user';
       let candidate = base;
-      for (let n = 1; getUserByUsername(candidate); n++) candidate = `${base}${n}`.slice(0, 20);
+      for (let n = 1; await getUserByUsername(candidate); n++) candidate = `${base}${n}`.slice(0, 20);
       name = candidate;
     }
     // Google-only accounts get a random, unusable password hash and are
     // verified from the start (Google already verified the email).
-    db.prepare(
-      'INSERT INTO users (username, password_hash, created_at, email, verified) VALUES (?, ?, ?, ?, 1)'
-    ).run(name, `google:${randomBytes(16).toString('hex')}`, Date.now(), email);
-    user = getUserByUsername(name);
+    await dbRun(
+      'INSERT INTO users (username, password_hash, created_at, email, verified) VALUES (?, ?, ?, ?, 1)',
+      [name, `google:${randomBytes(16).toString('hex')}`, Date.now(), email]
+    );
+    user = await getUserByUsername(name);
   }
-  const token = newSession(user.id);
+  const token = await newSession(user.id);
   setSessionCookie(res, token);
   res.json({ ok: true, token, username: user.username });
-});
+}));
 
 // POST /api/verify-email {email, code} → {ok:true}
 // Also completes a pending email change when `email` matches the account's
 // pending_email (email becomes the new address, pending fields cleared).
-app.post('/api/verify-email', rateLimit('verify', 20), (req, res) => {
+app.post('/api/verify-email', rateLimit('verify', 20), ah(async (req, res) => {
   const { email, code } = req.body || {};
   const mail = normalizeEmail(email);
   const codeStr = String(code || '').trim();
   // Look up by current email OR by a pending new address (email change flow).
   const user =
-    getUserByEmail(mail) ||
-    db.prepare('SELECT * FROM users WHERE pending_email = ?').get(mail);
+    await getUserByEmail(mail) ||
+    (await dbGet('SELECT * FROM users WHERE pending_email = ?', [mail]));
 
   // Case 1: pending email change for this address.
   if (user && user.pending_email && normalizeEmail(user.pending_email) === mail) {
@@ -836,10 +889,11 @@ app.post('/api/verify-email', rateLimit('verify', 20), (req, res) => {
     if (user.pending_expiry < Date.now()) {
       return res.status(400).json({ error: 'expired', message: 'That code expired. Request a new one.' });
     }
-    db.prepare(
-      'UPDATE users SET email = ?, verified = 1, pending_email = NULL, pending_code = NULL, pending_expiry = NULL WHERE id = ?'
-    ).run(mail, user.id);
-    const token = newSession(user.id);
+    await dbRun(
+      'UPDATE users SET email = ?, verified = 1, pending_email = NULL, pending_code = NULL, pending_expiry = NULL WHERE id = ?',
+      [mail, user.id]
+    );
+    const token = await newSession(user.id);
     setSessionCookie(res, token);
     return res.json({ ok: true, token, username: user.username, emailChanged: true });
   }
@@ -857,18 +911,17 @@ app.post('/api/verify-email', rateLimit('verify', 20), (req, res) => {
       .status(400)
       .json({ error: 'expired', message: 'That code expired. Request a new one.' });
   }
-  db.prepare('UPDATE users SET verified = 1, verify_code = NULL, verify_expiry = NULL WHERE id = ?')
-    .run(user.id);
-  const token = newSession(user.id);
+  (await dbRun('UPDATE users SET verified = 1, verify_code = NULL, verify_expiry = NULL WHERE id = ?', [user.id]));
+  const token = await newSession(user.id);
   setSessionCookie(res, token);
   res.json({ ok: true, token, username: user.username });
-});
+}));
 
 // POST /api/resend-code {email} → {ok:true}; 429 if asked again within 60s.
 // Works for new-account verification AND for pending email changes
 // (pass the new/pending address in that case).
 const lastCodeSent = new Map(); // normalized email → epoch ms (best effort, in-memory)
-app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
+app.post('/api/resend-code', rateLimit('resend', 10), ah(async (req, res) => {
   const mail = normalizeEmail(req.body && req.body.email);
   if (!mail) return res.status(400).json({ error: 'bad_request', message: 'Email required.' });
   const now = Date.now();
@@ -884,15 +937,14 @@ app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
     return res.status(422).json({ error: 'email_not_configured' });
   }
   const user =
-    getUserByEmail(mail) ||
-    db.prepare('SELECT * FROM users WHERE pending_email = ?').get(mail);
+    await getUserByEmail(mail) ||
+    (await dbGet('SELECT * FROM users WHERE pending_email = ?', [mail]));
   if (user) {
     const isPending = user.pending_email && normalizeEmail(user.pending_email) === mail;
     if (isPending) {
       // Pending email change: fresh code goes to the NEW address.
       const code = genCode();
-      db.prepare('UPDATE users SET pending_code = ?, pending_expiry = ? WHERE id = ?')
-        .run(code, now + CODE_TTL_MS, user.id);
+      (await dbRun('UPDATE users SET pending_code = ?, pending_expiry = ? WHERE id = ?', [code, now + CODE_TTL_MS, user.id]));
       try {
         await sendMail(mail, 'Your Chatly verification code', verifyEmailText(code));
       } catch (e) {
@@ -903,8 +955,7 @@ app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
     } else if (!user.verified) {
       // New-account verification.
       const code = genCode();
-      db.prepare('UPDATE users SET verify_code = ?, verify_expiry = ? WHERE id = ?')
-        .run(code, now + CODE_TTL_MS, user.id);
+      (await dbRun('UPDATE users SET verify_code = ?, verify_expiry = ? WHERE id = ?', [code, now + CODE_TTL_MS, user.id]));
       try {
         await sendMail(mail, 'Your Chatly verification code', verifyEmailText(code));
       } catch (e) {
@@ -917,20 +968,19 @@ app.post('/api/resend-code', rateLimit('resend', 10), async (req, res) => {
   }
   lastCodeSent.set(mail, now);
   res.json({ ok: true });
-});
+}));
 
 // POST /api/forgot-password {email} → always {ok:true} (no account probing).
-app.post('/api/forgot-password', rateLimit('forgot', 10), async (req, res) => {
+app.post('/api/forgot-password', rateLimit('forgot', 10), ah(async (req, res) => {
   const mail = normalizeEmail(req.body && req.body.email);
   if (!mail) return res.status(400).json({ error: 'bad_request', message: 'Email required.' });
   if (!smtpConfigured()) {
     return res.status(422).json({ error: 'email_not_configured' });
   }
-  const user = getUserByEmail(mail);
+  const user = await getUserByEmail(mail);
   if (user) {
     const code = genCode();
-    db.prepare('UPDATE users SET reset_code = ?, reset_expiry = ? WHERE id = ?')
-      .run(code, Date.now() + CODE_TTL_MS, user.id);
+    (await dbRun('UPDATE users SET reset_code = ?, reset_expiry = ? WHERE id = ?', [code, Date.now() + CODE_TTL_MS, user.id]));
     try {
       await sendMail(mail, 'Your Chatly password reset code', resetEmailText(code));
     } catch (e) {
@@ -939,12 +989,12 @@ app.post('/api/forgot-password', rateLimit('forgot', 10), async (req, res) => {
     }
   }
   res.json({ ok: true });
-});
+}));
 
 // POST /api/reset-password {email, code, newPassword} → {ok:true}
-app.post('/api/reset-password', rateLimit('reset', 10), (req, res) => {
+app.post('/api/reset-password', rateLimit('reset', 10), ah(async (req, res) => {
   const { email, code, newPassword } = req.body || {};
-  const user = getUserByEmail(email);
+  const user = await getUserByEmail(email);
   if (!user || !user.reset_code || String(code || '').trim() !== user.reset_code) {
     return res.status(400).json({ error: 'bad_code', message: 'Wrong reset code.' });
   }
@@ -954,27 +1004,26 @@ app.post('/api/reset-password', rateLimit('reset', 10), (req, res) => {
   if (typeof newPassword !== 'string' || newPassword.length < 6 || newPassword.length > 200) {
     return res.status(400).json({ error: 'weak_password', message: 'Password must be at least 6 characters.' });
   }
-  db.prepare('UPDATE users SET password_hash = ?, reset_code = NULL, reset_expiry = NULL WHERE id = ?')
-    .run(hashPassword(newPassword), user.id);
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id); // log out everywhere
+  (await dbRun('UPDATE users SET password_hash = ?, reset_code = NULL, reset_expiry = NULL WHERE id = ?', [hashPassword(newPassword), user.id]));
+  (await dbRun('DELETE FROM sessions WHERE user_id = ?', [user.id])); // log out everywhere
   res.json({ ok: true });
-});
+}));
 
 // POST /api/check-username {username} → {available:true/false}
-app.post('/api/check-username', (req, res) => {
+app.post('/api/check-username', ah(async (req, res) => {
   const username = String((req.body && req.body.username) || '').trim();
   if (!USERNAME_RE.test(username)) return res.json({ available: false, reason: 'invalid' });
-  res.json({ available: !getUserByUsername(username) });
-});
+  res.json({ available: !await getUserByUsername(username) });
+}));
 
 // POST /api/change-password {token,newPassword} or {username,oldPassword,newPassword}
-app.post('/api/change-password', rateLimit('changepw', 10), (req, res) => {
+app.post('/api/change-password', rateLimit('changepw', 10), ah(async (req, res) => {
   const { token, username, oldPassword, newPassword } = req.body || {};
   let user = null;
   if (token) {
-    user = apiUserFromToken(String(token));
+    user = await apiUserFromToken(String(token));
   } else if (typeof username === 'string' && typeof oldPassword === 'string') {
-    const row = getUserByUsername(username);
+    const row = await getUserByUsername(username);
     if (row && verifyPassword(oldPassword, row.password_hash)) user = row;
   }
   if (!user) {
@@ -983,16 +1032,16 @@ app.post('/api/change-password', rateLimit('changepw', 10), (req, res) => {
   if (typeof newPassword !== 'string' || newPassword.length < 6 || newPassword.length > 200) {
     return res.status(400).json({ error: 'weak_password', message: 'Password must be at least 6 characters.' });
   }
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(newPassword), user.id);
+  (await dbRun('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(newPassword), user.id]));
   res.json({ ok: true });
-});
+}));
 
 // POST /api/set-email {token, email} — for legacy accounts without an email:
 // sets it, marks the account unverified, and sends a code.
-app.post('/api/set-email', rateLimit('setemail', 10), async (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/set-email', rateLimit('setemail', 10), ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
-  const full = getUserById(user.id);
+  const full = await getUserById(user.id);
   if (full.email) {
     return res.status(400).json({ error: 'already_set', message: 'This account already has an email.' });
   }
@@ -1000,15 +1049,14 @@ app.post('/api/set-email', rateLimit('setemail', 10), async (req, res) => {
   if (!EMAIL_RE.test(mail)) {
     return res.status(400).json({ error: 'invalid_email', message: 'That email address looks invalid.' });
   }
-  if (getUserByEmail(mail)) {
+  if (await getUserByEmail(mail)) {
     return res.status(409).json({ error: 'email_taken', message: 'That email is already registered.' });
   }
   if (!smtpConfigured()) {
     return res.status(422).json({ error: 'email_not_configured' });
   }
   const code = genCode();
-  db.prepare('UPDATE users SET email = ?, verified = 0, verify_code = ?, verify_expiry = ? WHERE id = ?')
-    .run(mail, code, Date.now() + CODE_TTL_MS, user.id);
+  (await dbRun('UPDATE users SET email = ?, verified = 0, verify_code = ?, verify_expiry = ? WHERE id = ?', [mail, code, Date.now() + CODE_TTL_MS, user.id]));
   try {
     await sendMail(mail, 'Your Chatly verification code', verifyEmailText(code));
   } catch (e) {
@@ -1017,28 +1065,29 @@ app.post('/api/set-email', rateLimit('setemail', 10), async (req, res) => {
     return res.status(422).json({ error: 'email_send_failed' });
   }
   res.json({ ok: true, email: mail, message: 'Verification code sent. Check your inbox.' });
-});
+}));
 
 // POST /api/change-email {token, newEmail} — re-verification flow:
 // stores the new address as pending, emails a 6-digit code (10 min) to the
 // NEW address. Completes via POST /api/verify-email {email:newEmail, code}.
-app.post('/api/change-email', rateLimit('changeemail', 10), async (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/change-email', rateLimit('changeemail', 10), ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const newMail = normalizeEmail(req.body && req.body.newEmail);
   if (!EMAIL_RE.test(newMail)) {
     return res.status(400).json({ error: 'invalid_email', message: 'That email address looks invalid.' });
   }
-  const full = getUserById(user.id);
+  const full = await getUserById(user.id);
   if (full.email && normalizeEmail(full.email) === newMail) {
     return res.status(400).json({ error: 'same_email', message: 'That is already your email address.' });
   }
-  if (getUserByEmail(newMail)) {
+  if (await getUserByEmail(newMail)) {
     return res.status(409).json({ error: 'email_taken', message: 'That email is already registered.' });
   }
-  const pendingTaken = db
-    .prepare('SELECT id FROM users WHERE pending_email = ? AND id != ?')
-    .get(newMail, user.id);
+  const pendingTaken = await dbGet('SELECT id FROM users WHERE pending_email = ? AND id != ?', [
+    newMail,
+    user.id,
+  ]);
   if (pendingTaken) {
     return res.status(409).json({ error: 'email_taken', message: 'That email is already registered.' });
   }
@@ -1049,8 +1098,7 @@ app.post('/api/change-email', rateLimit('changeemail', 10), async (req, res) => 
     });
   }
   const code = genCode();
-  db.prepare('UPDATE users SET pending_email = ?, pending_code = ?, pending_expiry = ? WHERE id = ?')
-    .run(newMail, code, Date.now() + CODE_TTL_MS, user.id);
+  (await dbRun('UPDATE users SET pending_email = ?, pending_code = ?, pending_expiry = ? WHERE id = ?', [newMail, code, Date.now() + CODE_TTL_MS, user.id]));
   try {
     await sendMail(newMail, 'Your Chatly verification code', verifyEmailText(code));
   } catch (e) {
@@ -1059,13 +1107,13 @@ app.post('/api/change-email', rateLimit('changeemail', 10), async (req, res) => 
     return res.status(422).json({ error: 'email_send_failed', message: 'Could not send the email.' });
   }
   res.json({ ok: true, pendingEmail: newMail, message: 'Verification code sent to your new address.' });
-});
+}));
 
 // --- profiles ---------------------------------------------------------------
 
 // POST /api/set-profile {token, name?, bio?, avatar?} — avatar ≤ 500KB else 413.
-app.post('/api/set-profile', (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/set-profile', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const { name, bio, avatar } = req.body || {};
   if (avatar != null) {
@@ -1083,32 +1131,33 @@ app.post('/api/set-profile', (req, res) => {
   if (bio != null && String(bio).length > 500) {
     return res.status(400).json({ error: 'bad_request', message: 'Bio is too long (max 500).' });
   }
-  db.prepare('UPDATE users SET display_name = ?, bio = ?, avatar = ? WHERE id = ?').run(
-    name != null ? String(name) : getUserById(user.id).display_name,
-    bio != null ? String(bio) : getUserById(user.id).bio,
-    avatar != null ? String(avatar) : getUserById(user.id).avatar,
-    user.id
-  );
-  res.json({ ok: true, profile: publicProfile(getUserById(user.id)) });
-});
+  const cur = await getUserById(user.id);
+  await dbRun('UPDATE users SET display_name = ?, bio = ?, avatar = ? WHERE id = ?', [
+    name != null ? String(name) : cur.display_name,
+    bio != null ? String(bio) : cur.bio,
+    avatar != null ? String(avatar) : cur.avatar,
+    user.id,
+  ]);
+  res.json({ ok: true, profile: await publicProfile(await getUserById(user.id)) });
+}));
 
 // GET /api/profile/:username → public profile + online presence.
 // Honors the target's privacy settings (photo/about/lastSeen); the owner
 // always sees their own full profile. Auth is optional.
-app.get('/api/profile/:username', (req, res) => {
-  const u = getUserByUsername(req.params.username);
+app.get('/api/profile/:username', ah(async (req, res) => {
+  const u = await getUserByUsername(req.params.username);
   if (!u) return res.status(404).json({ error: 'not_found', message: 'No such user.' });
-  const viewer = getUserFromReq(req) || getApiUser(req);
-  res.json(publicProfile(u, viewer));
-});
+  const viewer = await getUserFromReq(req) || await getApiUser(req);
+  res.json(await publicProfile(u, viewer));
+}));
 
 // POST /api/set-privacy {token, lastSeen?, photo?, about?}
 // Each value: "everyone" | "nobody". Read receipts stay client-side only.
-app.post('/api/set-privacy', (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/set-privacy', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
   const b = req.body || {};
-  const cur = getPrivacy(getUserById(user.id));
+  const cur = getPrivacy(await getUserById(user.id));
   for (const key of ['lastSeen', 'photo', 'about']) {
     if (b[key] === undefined) continue;
     if (b[key] !== 'everyone' && b[key] !== 'nobody') {
@@ -1118,175 +1167,178 @@ app.post('/api/set-privacy', (req, res) => {
     }
     cur[key] = b[key];
   }
-  db.prepare('UPDATE users SET privacy = ? WHERE id = ?').run(JSON.stringify(cur), user.id);
+  (await dbRun('UPDATE users SET privacy = ? WHERE id = ?', [JSON.stringify(cur), user.id]));
   res.json({ ok: true, privacy: cur });
-});
+}));
 
 // POST /api/delete-account {token, password} — permanently deletes the
 // account and all of the user's data (messages, groups, statuses, sessions…).
-app.post('/api/delete-account', (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/delete-account', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Not logged in.' });
-  const full = getUserById(user.id);
+  const full = await getUserById(user.id);
   if (!full || !verifyPassword(String((req.body && req.body.password) || ''), full.password_hash)) {
     return res.status(403).json({ error: 'bad_password', message: 'Wrong password.' });
   }
   const id = user.id;
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
-  db.prepare('DELETE FROM messages WHERE sender_id = ? OR recipient_id = ?').run(id, id);
-  db.prepare('DELETE FROM group_messages WHERE sender_id = ?').run(id);
-  db.prepare('DELETE FROM group_members WHERE user_id = ?').run(id);
-  db.prepare('DELETE FROM groups WHERE creator_id = ?').run(id);
-  db.prepare('DELETE FROM statuses WHERE user_id = ?').run(id);
-  db.prepare('DELETE FROM channel_subs WHERE user_id = ?').run(id);
-  db.prepare('DELETE FROM channels WHERE creator_id = ?').run(id);
-  for (const row of db.prepare('SELECT id, blocked FROM users').all()) {
+  (await dbRun('DELETE FROM sessions WHERE user_id = ?', [id]));
+  (await dbRun('DELETE FROM messages WHERE sender_id = ? OR recipient_id = ?', [id, id]));
+  (await dbRun('DELETE FROM group_messages WHERE sender_id = ?', [id]));
+  (await dbRun('DELETE FROM group_members WHERE user_id = ?', [id]));
+  (await dbRun('DELETE FROM groups WHERE creator_id = ?', [id]));
+  (await dbRun('DELETE FROM statuses WHERE user_id = ?', [id]));
+  (await dbRun('DELETE FROM channel_subs WHERE user_id = ?', [id]));
+  (await dbRun('DELETE FROM channels WHERE creator_id = ?', [id]));
+  for (const row of (await dbAll('SELECT id, blocked FROM users'))) {
     try {
       const arr = JSON.parse(row.blocked || '[]').filter((x) => x !== id);
-      db.prepare('UPDATE users SET blocked = ? WHERE id = ?').run(JSON.stringify(arr), row.id);
+      (await dbRun('UPDATE users SET blocked = ? WHERE id = ?', [JSON.stringify(arr), row.id]));
     } catch {
       /* keep going */
     }
   }
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  (await dbRun('DELETE FROM users WHERE id = ?', [id]));
   res.json({ ok: true });
-});
+}));
 
 // --- blocks -----------------------------------------------------------------
 
 // POST /api/block {token, username} / POST /api/unblock {token, username}
 // GET /api/blocked?token= → {blocked:[usernames]}
-function blockTarget(req, res, block) {
-  const user = getApiUser(req);
+async function blockTarget(req, res, block) {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
-  const target = getUserByUsername(req.body && req.body.username);
+  const target = await getUserByUsername(req.body && req.body.username);
   if (!target || target.id === user.id) {
     return res.status(404).json({ error: 'not_found', message: 'No such user.' });
   }
-  const ids = blockedIds(user.id);
+  const ids = await blockedIds(user.id);
   if (block) ids.add(target.id);
   else ids.delete(target.id);
-  setBlockedIds(user.id, ids);
-  res.json({ ok: true, blocked: blockedUsernames(user.id) });
+  await setBlockedIds(user.id, ids);
+  res.json({ ok: true, blocked: await blockedUsernames(user.id) });
 }
 
-app.post('/api/block', (req, res) => blockTarget(req, res, true));
-app.post('/api/unblock', (req, res) => blockTarget(req, res, false));
+app.post('/api/block', ah(async (req, res) => await blockTarget(req, res, true)));
+app.post('/api/unblock', ah(async (req, res) => await blockTarget(req, res, false)));
 
-app.get('/api/blocked', (req, res) => {
-  const user = getApiUser(req);
+app.get('/api/blocked', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
-  res.json({ blocked: blockedUsernames(user.id) });
-});
+  res.json({ blocked: await blockedUsernames(user.id) });
+}));
 
 // --- groups -----------------------------------------------------------------
 
-app.post('/api/groups/create', (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/groups/create', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const name = String((req.body && req.body.name) || '').trim().slice(0, 80);
   if (!name) return res.status(400).json({ error: 'bad_request', message: 'Group name required.' });
   const wanted = Array.isArray(req.body.members) ? req.body.members : [];
   const memberIds = new Set([user.id]);
   for (const m of wanted) {
-    const u = getUserByUsername(m);
+    const u = await getUserByUsername(m);
     if (u && u.id !== user.id) memberIds.add(u.id);
   }
-  const info = db
-    .prepare('INSERT INTO groups (name, creator_id, created_at) VALUES (?, ?, ?)')
-    .run(name, user.id, Date.now());
-  const gid = info.lastInsertRowid;
-  const add = db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)');
-  for (const id of memberIds) add.run(gid, id);
-  res.json(groupSummary(gid));
-});
+  const info = await dbRun('INSERT INTO groups (name, creator_id, created_at) VALUES (?, ?, ?)', [
+    name,
+    user.id,
+    Date.now(),
+  ]);
+  const gid = Number(info.lastInsertRowid);
+  for (const id of memberIds) {
+    await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)', [gid, id]);
+  }
+  res.json(await groupSummary(gid));
+}));
 
-app.get('/api/groups', (req, res) => {
-  const user = getApiUser(req);
+app.get('/api/groups', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
-  const rows = db
-    .prepare('SELECT group_id FROM group_members WHERE user_id = ? ORDER BY group_id DESC')
-    .all(user.id);
-  res.json({ groups: rows.map((r) => groupSummary(r.group_id)).filter(Boolean) });
-});
+  const rows = await dbAll('SELECT group_id FROM group_members WHERE user_id = ? ORDER BY group_id DESC', [
+    user.id,
+  ]);
+  const groups = await Promise.all(rows.map(async (r) => await groupSummary(r.group_id)));
+  res.json({ groups: groups.filter(Boolean) });
+}));
 
-app.post('/api/groups/:id/add', (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/groups/:id/add', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const gid = Number(req.params.id);
-  if (!groupSummary(gid) || !isMember(gid, user.id)) {
+  if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
-  const target = getUserByUsername(req.body && req.body.username);
+  const target = await getUserByUsername(req.body && req.body.username);
   if (!target) return res.status(404).json({ error: 'not_found', message: 'No such user.' });
-  if (isMember(gid, target.id)) {
+  if (await isMember(gid, target.id)) {
     return res.status(400).json({ error: 'already_member', message: 'User is already in the group.' });
   }
-  db.prepare('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)').run(gid, target.id);
-  res.json(groupSummary(gid));
-});
+  (await dbRun('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [gid, target.id]));
+  res.json(await groupSummary(gid));
+}));
 
-app.post('/api/groups/:id/remove', (req, res) => {
-  const user = getApiUser(req);
+app.post('/api/groups/:id/remove', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const gid = Number(req.params.id);
-  if (!groupSummary(gid) || !isMember(gid, user.id)) {
+  if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
-  const target = getUserByUsername(req.body && req.body.username);
-  if (!target || !isMember(gid, target.id)) {
+  const target = await getUserByUsername(req.body && req.body.username);
+  if (!target || !await isMember(gid, target.id)) {
     return res.status(404).json({ error: 'not_member', message: 'User is not in the group.' });
   }
-  db.prepare('DELETE FROM group_members WHERE group_id = ? AND user_id = ?').run(gid, target.id);
-  const left = db.prepare('SELECT COUNT(*) AS c FROM group_members WHERE group_id = ?').get(gid).c;
+  (await dbRun('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [gid, target.id]));
+  const left = (await dbGet('SELECT COUNT(*) AS c FROM group_members WHERE group_id = ?', [gid])).c;
   if (left === 0) {
-    db.prepare('DELETE FROM group_messages WHERE group_id = ?').run(gid);
-    db.prepare('DELETE FROM groups WHERE id = ?').run(gid);
+    (await dbRun('DELETE FROM group_messages WHERE group_id = ?', [gid]));
+    (await dbRun('DELETE FROM groups WHERE id = ?', [gid]));
     return res.json({ ok: true, deleted: true });
   }
-  res.json(groupSummary(gid));
-});
+  res.json(await groupSummary(gid));
+}));
 
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,
 // expired messages excluded, messages from blocked senders hidden.
-app.get('/api/groups/:id/history', (req, res) => {
-  const user = getApiUser(req);
+app.get('/api/groups/:id/history', ah(async (req, res) => {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const gid = Number(req.params.id);
-  if (!groupSummary(gid) || !isMember(gid, user.id)) {
+  if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
   const now = Date.now();
-  const rows = db
-    .prepare(
-      `SELECT gm.*, u.username AS sender_username FROM group_messages gm
-       JOIN users u ON u.id = gm.sender_id
-       WHERE gm.group_id = ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
-       ORDER BY gm.id DESC LIMIT ?`
-    )
-    .all(gid, now, limit);
+  const rows = await dbAll(
+    `SELECT gm.*, u.username AS sender_username FROM group_messages gm
+     JOIN users u ON u.id = gm.sender_id
+     WHERE gm.group_id = ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
+     ORDER BY gm.id DESC LIMIT ?`,
+    [gid, now, limit]
+  );
   rows.reverse();
-  const blocked = blockedIds(user.id);
+  const blocked = await blockedIds(user.id);
   res.json({
     groupId: gid,
     messages: rows
       .filter((m) => !blocked.has(m.sender_id))
       .map((m) => toClientGroupMessage(m, m.sender_username)),
   });
-});
+}));
 
 // --- statuses (24h stories) --------------------------------------------------
 // Expired statuses (>24h) are purged on every read.
 
 const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 
-function purgeStatuses() {
-  db.prepare('DELETE FROM statuses WHERE expire_at <= ?').run(Date.now());
+async function purgeStatuses() {
+  (await dbRun('DELETE FROM statuses WHERE expire_at <= ?', [Date.now()]));
 }
 
-function toClientStatus(s) {
-  const u = getUserById(s.user_id);
+async function toClientStatus(s) {
+  const u = await getUserById(s.user_id);
   return {
     statusId: s.id,
     username: u ? u.username : null,
@@ -1303,7 +1355,7 @@ function toClientStatus(s) {
 }
 
 // POST /api/status {token, kind:"text"|"image", text?, data? (base64 ≤1MB), bg?}
-app.post('/api/status', requireApiUser, (req, res) => {
+app.post('/api/status', requireApiUser, ah(async (req, res) => {
   const { kind, text, data, bg } = req.body || {};
   const k = kind === 'image' ? 'image' : 'text';
   let payload = null;
@@ -1320,62 +1372,59 @@ app.post('/api/status', requireApiUser, (req, res) => {
     return res.status(400).json({ error: 'bad_request', message: 'Text status needs text.' });
   }
   const now = Date.now();
-  const info = db
-    .prepare(
-      'INSERT INTO statuses (user_id, kind, text, data, bg, created_at, expire_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    )
-    .run(
+  const info = await dbRun(
+    'INSERT INTO statuses (user_id, kind, text, data, bg, created_at, expire_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [
       req.user.id,
       k,
       body,
       payload,
       typeof bg === 'number' ? String(Math.trunc(bg)) : typeof bg === 'string' ? bg.slice(0, 40) : null,
       now,
-      now + STATUS_TTL_MS
-    );
-  res.json({ ok: true, statusId: info.lastInsertRowid });
-});
+      now + STATUS_TTL_MS,
+    ]
+  );
+  res.json({ ok: true, statusId: Number(info.lastInsertRowid) });
+}));
 
 // GET /api/status/feed?token= — all non-expired statuses, newest first, cap 100.
 // Hides statuses from users you blocked or who blocked you.
-app.get('/api/status/feed', requireApiUser, (req, res) => {
-  purgeStatuses();
-  const rows = db
-    .prepare('SELECT * FROM statuses ORDER BY created_at DESC LIMIT 100')
-    .all();
-  const myBlocked = blockedIds(req.user.id);
+app.get('/api/status/feed', requireApiUser, ah(async (req, res) => {
+  await purgeStatuses();
+  const rows = await dbAll('SELECT * FROM statuses ORDER BY created_at DESC LIMIT 100');
+  const myBlocked = await blockedIds(req.user.id);
   const feed = [];
   for (const s of rows) {
     if (s.user_id === req.user.id) {
-      feed.push(toClientStatus(s));
+      feed.push(await toClientStatus(s));
       continue;
     }
     if (myBlocked.has(s.user_id)) continue; // I blocked them
-    if (isBlocked(req.user.id, s.user_id)) continue; // they blocked me
-    feed.push(toClientStatus(s));
+    if (await isBlocked(req.user.id, s.user_id)) continue; // they blocked me
+    feed.push(await toClientStatus(s));
   }
   res.json({ statuses: feed });
-});
+}));
 
 // DELETE /api/status/:id {token} — owner only.
-app.delete('/api/status/:id', requireApiUser, (req, res) => {
+app.delete('/api/status/:id', requireApiUser, ah(async (req, res) => {
   const id = Number(req.params.id);
-  const s = db.prepare('SELECT * FROM statuses WHERE id = ?').get(id);
+  const s = (await dbGet('SELECT * FROM statuses WHERE id = ?', [id]));
   if (!s) return res.status(404).json({ error: 'not_found', message: 'Status not found.' });
   if (s.user_id !== req.user.id) {
     return res.status(403).json({ error: 'forbidden', message: 'You can only delete your own statuses.' });
   }
-  db.prepare('DELETE FROM statuses WHERE id = ?').run(id);
+  (await dbRun('DELETE FROM statuses WHERE id = ?', [id]));
   res.json({ ok: true });
-});
+}));
 
 // --- channels (broadcast) -----------------------------------------------------
 
-function channelSummary(id, forUserId) {
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+async function channelSummary(id, forUserId) {
+  const c = (await dbGet('SELECT * FROM channels WHERE id = ?', [id]));
   if (!c) return null;
-  const creator = getUserById(c.creator_id);
-  const subs = db.prepare('SELECT COUNT(*) AS n FROM channel_subs WHERE channel_id = ?').get(id).n;
+  const creator = await getUserById(c.creator_id);
+  const subs = (await dbGet('SELECT COUNT(*) AS n FROM channel_subs WHERE channel_id = ?', [id])).n;
   const out = {
     channelId: c.id,
     id: c.id, // alias — some clients read "id"
@@ -1387,57 +1436,62 @@ function channelSummary(id, forUserId) {
   };
   if (forUserId) {
     out.mine = c.creator_id === forUserId;
-    out.subscribed = !!db
-      .prepare('SELECT 1 AS x FROM channel_subs WHERE channel_id = ? AND user_id = ?')
-      .get(id, forUserId);
+    out.subscribed = !!(await dbGet(
+      'SELECT 1 AS x FROM channel_subs WHERE channel_id = ? AND user_id = ?',
+      [id, forUserId]
+    ));
   }
   return out;
 }
 
 // POST /api/channels/create {token, name, description?} — creator auto-subscribed.
-app.post('/api/channels/create', requireApiUser, (req, res) => {
+app.post('/api/channels/create', requireApiUser, ah(async (req, res) => {
   const name = String((req.body && req.body.name) || '').trim().slice(0, 80);
   if (!name) return res.status(400).json({ error: 'bad_request', message: 'Channel name required.' });
   const description = String((req.body && req.body.description) || '').slice(0, 500);
-  const info = db
-    .prepare('INSERT INTO channels (name, description, creator_id, created_at) VALUES (?, ?, ?, ?)')
-    .run(name, description, req.user.id, Date.now());
-  db.prepare('INSERT OR IGNORE INTO channel_subs (channel_id, user_id) VALUES (?, ?)')
-    .run(info.lastInsertRowid, req.user.id);
-  const s = channelSummary(info.lastInsertRowid);
+  const info = await dbRun(
+    'INSERT INTO channels (name, description, creator_id, created_at) VALUES (?, ?, ?, ?)',
+    [name, description, req.user.id, Date.now()]
+  );
+  await dbRun('INSERT OR IGNORE INTO channel_subs (channel_id, user_id) VALUES (?, ?)', [
+    info.lastInsertRowid,
+    req.user.id,
+  ]);
+  const s = await channelSummary(info.lastInsertRowid);
   res.json({ ok: true, channelId: s.channelId, name: s.name });
-});
+}));
 
 // GET /api/channels?token= — public directory with subscriber counts. When a
 // token is supplied, each row also carries `mine` + `subscribed` for that user.
-app.get('/api/channels', (req, res) => {
-  const user = getApiUser(req);
-  const rows = db.prepare('SELECT id FROM channels ORDER BY id DESC LIMIT 200').all();
-  res.json({ channels: rows.map((r) => channelSummary(r.id, user ? user.id : undefined)).filter(Boolean) });
-});
+app.get('/api/channels', ah(async (req, res) => {
+  const user = await getApiUser(req);
+  const rows = (await dbAll('SELECT id FROM channels ORDER BY id DESC LIMIT 200'));
+  const chs = await Promise.all(rows.map(async (r) => await channelSummary(r.id, user ? user.id : undefined)));
+  res.json({ channels: chs.filter(Boolean) });
+}));
 
-function channelSubHandler(req, res, subscribe) {
-  const user = getApiUser(req);
+async function channelSubHandler(req, res, subscribe) {
+  const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const id = Number(req.params.id);
-  if (!channelSummary(id)) {
+  if (!await channelSummary(id)) {
     return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
   }
   if (subscribe) {
-    db.prepare('INSERT OR IGNORE INTO channel_subs (channel_id, user_id) VALUES (?, ?)').run(id, user.id);
+    (await dbRun('INSERT OR IGNORE INTO channel_subs (channel_id, user_id) VALUES (?, ?)', [id, user.id]));
   } else {
-    db.prepare('DELETE FROM channel_subs WHERE channel_id = ? AND user_id = ?').run(id, user.id);
+    (await dbRun('DELETE FROM channel_subs WHERE channel_id = ? AND user_id = ?', [id, user.id]));
   }
-  res.json({ ok: true, subscribers: db.prepare('SELECT COUNT(*) AS n FROM channel_subs WHERE channel_id = ?').get(id).n });
+  res.json({ ok: true, subscribers: (await dbGet('SELECT COUNT(*) AS n FROM channel_subs WHERE channel_id = ?', [id])).n });
 }
 
-app.post('/api/channels/:id/subscribe', (req, res) => channelSubHandler(req, res, true));
-app.post('/api/channels/:id/unsubscribe', (req, res) => channelSubHandler(req, res, false));
+app.post('/api/channels/:id/subscribe', ah(async (req, res) => await channelSubHandler(req, res, true)));
+app.post('/api/channels/:id/unsubscribe', ah(async (req, res) => await channelSubHandler(req, res, false)));
 
 // POST /api/channels/:id/post {token, text, kind?, data?} — creator only.
-app.post('/api/channels/:id/post', requireApiUser, (req, res) => {
+app.post('/api/channels/:id/post', requireApiUser, ah(async (req, res) => {
   const id = Number(req.params.id);
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  const c = (await dbGet('SELECT * FROM channels WHERE id = ?', [id]));
   if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
   if (c.creator_id !== req.user.id) {
     return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can post.' });
@@ -1456,22 +1510,24 @@ app.post('/api/channels/:id/post', requireApiUser, (req, res) => {
   if (kind === 'text' && !text.trim()) {
     return res.status(400).json({ error: 'bad_request', message: 'Post needs text.' });
   }
-  const info = db
-    .prepare('INSERT INTO channel_posts (channel_id, kind, text, data, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(id, kind, text, data, Date.now());
-  res.json({ ok: true, postId: info.lastInsertRowid });
-});
+  const info = await dbRun(
+    'INSERT INTO channel_posts (channel_id, kind, text, data, created_at) VALUES (?, ?, ?, ?, ?)',
+    [id, kind, text, data, Date.now()]
+  );
+  res.json({ ok: true, postId: Number(info.lastInsertRowid) });
+}));
 
 // GET /api/channels/:id/posts — public read, newest first, cap 100.
-app.get('/api/channels/:id/posts', (req, res) => {
+app.get('/api/channels/:id/posts', ah(async (req, res) => {
   const id = Number(req.params.id);
-  if (!channelSummary(id)) {
+  if (!await channelSummary(id)) {
     return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
   }
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 100);
-  const rows = db
-    .prepare('SELECT * FROM channel_posts WHERE channel_id = ? ORDER BY id DESC LIMIT ?')
-    .all(id, limit);
+  const rows = await dbAll('SELECT * FROM channel_posts WHERE channel_id = ? ORDER BY id DESC LIMIT ?', [
+    id,
+    limit,
+  ]);
   res.json({
     channelId: id,
     posts: rows.map((p) => ({
@@ -1483,37 +1539,36 @@ app.get('/api/channels/:id/posts', (req, res) => {
       createdAt: Math.floor(p.created_at / 1000),
     })),
   });
-});
+}));
 
 // DELETE /api/channels/:id {token} — creator only; wipes posts + subscriptions.
-app.delete('/api/channels/:id', requireApiUser, (req, res) => {
+app.delete('/api/channels/:id', requireApiUser, ah(async (req, res) => {
   const id = Number(req.params.id);
-  const c = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  const c = (await dbGet('SELECT * FROM channels WHERE id = ?', [id]));
   if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
   if (c.creator_id !== req.user.id) {
     return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can delete it.' });
   }
-  db.prepare('DELETE FROM channel_posts WHERE channel_id = ?').run(id);
-  db.prepare('DELETE FROM channel_subs WHERE channel_id = ?').run(id);
-  db.prepare('DELETE FROM channels WHERE id = ?').run(id);
+  (await dbRun('DELETE FROM channel_posts WHERE channel_id = ?', [id]));
+  (await dbRun('DELETE FROM channel_subs WHERE channel_id = ?', [id]));
+  (await dbRun('DELETE FROM channels WHERE id = ?', [id]));
   res.json({ ok: true });
-});
+}));
 
 // --- discover -------------------------------------------------------------------
 
 // GET /api/discover/users?q={prefix}&token= — username/name prefix search,
 // cap 20, excludes self.
-app.get('/api/discover/users', requireApiUser, (req, res) => {
+app.get('/api/discover/users', requireApiUser, ah(async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 30);
   if (!q) return res.json({ users: [] });
   const like = `${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
-  const rows = db
-    .prepare(
-      `SELECT id, username, display_name, bio, avatar FROM users
-       WHERE id != ? AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')
-       ORDER BY username LIMIT 20`
-    )
-    .all(req.user.id, like, like);
+  const rows = await dbAll(
+    `SELECT id, username, display_name, bio, avatar FROM users
+     WHERE id != ? AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')
+     ORDER BY username LIMIT 20`,
+    [req.user.id, like, like]
+  );
   const ids = onlineIds();
   res.json({
     users: rows.map((u) => ({
@@ -1524,107 +1579,118 @@ app.get('/api/discover/users', requireApiUser, (req, res) => {
       online: ids.includes(u.id),
     })),
   });
-});
+}));
 
 // --- users & chats (v1/v2 behavior, plus expiry filtering) -------------------
 
-app.get('/api/users', requireAuth, (req, res) => {
+app.get('/api/users', requireAuth, ah(async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (q.length < 1) return res.json({ users: [] });
-  const rows = db
-    .prepare(
-      "SELECT id, username FROM users WHERE id != ? AND username LIKE ? ESCAPE '\\' ORDER BY username LIMIT 20"
-    )
-    .all(req.user.id, `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`);
+  const rows = await dbAll(
+    "SELECT id, username FROM users WHERE id != ? AND username LIKE ? ESCAPE '\\' ORDER BY username LIMIT 20",
+    [req.user.id, `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`]
+  );
   // last_seen is included only when the target's privacy allows it.
-  const users = rows.map((r) => {
-    const u = getUserById(r.id);
-    const priv = getPrivacy(u);
-    return {
-      id: r.id,
-      username: r.username,
-      last_seen: priv.lastSeen !== 'nobody' ? u.last_seen || null : null,
-    };
-  });
+  const users = await Promise.all(
+    rows.map(async (r) => {
+      const u = await getUserById(r.id);
+      const priv = getPrivacy(u);
+      return {
+        id: r.id,
+        username: r.username,
+        last_seen: priv.lastSeen !== 'nobody' ? u.last_seen || null : null,
+      };
+    })
+  );
   res.json({ users });
-});
+}));
 
-function conversationList(userId) {
+async function conversationList(userId) {
   const now = Date.now();
   const live = '(expire_at IS NULL OR expire_at > ?)';
   // One row per conversation partner, with last message + unread count.
-  const rows = db
-    .prepare(
-      `SELECT
-         CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS partner_id,
-         MAX(m.id) AS last_id
-       FROM messages m
-       WHERE (m.sender_id = ? OR m.recipient_id = ?) AND ${live}
-       GROUP BY partner_id
-       ORDER BY last_id DESC
-       LIMIT 100`
-    )
-    .all(userId, userId, userId, now);
-  const unread = new Map(
-    db
-      .prepare(
-        `SELECT sender_id, COUNT(*) AS c FROM messages
-         WHERE recipient_id = ? AND status < 2 AND ${live} GROUP BY sender_id`
-      )
-      .all(userId, now)
-      .map((r) => [r.sender_id, r.c])
+  const rows = await dbAll(
+    `SELECT
+       CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS partner_id,
+       MAX(m.id) AS last_id
+     FROM messages m
+     WHERE (m.sender_id = ? OR m.recipient_id = ?) AND ${live}
+     GROUP BY partner_id
+     ORDER BY last_id DESC
+     LIMIT 100`,
+    [userId, userId, userId, now]
   );
-  return rows.map((r) => {
-    const partner = db.prepare('SELECT id, username FROM users WHERE id = ?').get(r.partner_id);
-    const last = db.prepare('SELECT * FROM messages WHERE id = ?').get(r.last_id);
-    return {
-      partner,
-      lastMessage: toClientMessage(last),
-      unreadCount: unread.get(r.partner_id) || 0,
-    };
-  });
+  const unread = new Map(
+    (
+      await dbAll(
+        `SELECT sender_id, COUNT(*) AS c FROM messages
+         WHERE recipient_id = ? AND status < 2 AND ${live} GROUP BY sender_id`,
+        [userId, now]
+      )
+    ).map((r) => [r.sender_id, r.c])
+  );
+  return Promise.all(
+    rows.map(async (r) => {
+      const partner = (await dbGet('SELECT id, username FROM users WHERE id = ?', [r.partner_id]));
+      const last = (await dbGet('SELECT * FROM messages WHERE id = ?', [r.last_id]));
+      return {
+        partner,
+        lastMessage: toClientMessage(last),
+        unreadCount: unread.get(r.partner_id) || 0,
+      };
+    })
+  );
 }
 
-app.get('/api/chats', requireAuth, (req, res) => {
-  res.json({ chats: conversationList(req.user.id) });
-});
+app.get('/api/chats', requireAuth, ah(async (req, res) => {
+  res.json({ chats: await conversationList(req.user.id) });
+}));
 
-app.get('/api/messages/:partnerId', requireAuth, (req, res) => {
+app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
   const partnerId = Number(req.params.partnerId);
   const before = Number(req.query.before || 0);
   const limit = Math.min(Number(req.query.limit || 50), 100);
   const now = Date.now();
   const live = '(expire_at IS NULL OR expire_at > ?)';
-  const partner = db.prepare('SELECT id, username FROM users WHERE id = ?').get(partnerId);
+  const partner = (await dbGet('SELECT id, username FROM users WHERE id = ?', [partnerId]));
   if (!partner || partnerId === req.user.id) {
     return res.status(404).json({ error: 'not_found', message: 'Chat not found.' });
   }
   let rows;
   const convo = `((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) AND ${live}`;
   if (before > 0) {
-    rows = db
-      .prepare(
-        `SELECT * FROM messages WHERE ${convo} AND id < ? ORDER BY id DESC LIMIT ?`
-      )
-      .all(req.user.id, partnerId, partnerId, req.user.id, now, before, limit);
+    rows = await dbAll(`SELECT * FROM messages WHERE ${convo} AND id < ? ORDER BY id DESC LIMIT ?`, [
+      req.user.id,
+      partnerId,
+      partnerId,
+      req.user.id,
+      now,
+      before,
+      limit,
+    ]);
   } else {
-    rows = db
-      .prepare(`SELECT * FROM messages WHERE ${convo} ORDER BY id DESC LIMIT ?`)
-      .all(req.user.id, partnerId, partnerId, req.user.id, now, limit);
+    rows = await dbAll(`SELECT * FROM messages WHERE ${convo} ORDER BY id DESC LIMIT ?`, [
+      req.user.id,
+      partnerId,
+      partnerId,
+      req.user.id,
+      now,
+      limit,
+    ]);
   }
   rows.reverse();
 
   // Opening the latest view marks everything from the partner as read.
   if (!before) {
-    const pending = db
-      .prepare(
-        `SELECT id FROM messages WHERE sender_id = ? AND recipient_id = ? AND status < 2 AND ${live}`
-      )
-      .all(partnerId, req.user.id, now);
+    const pending = await dbAll(
+      `SELECT id FROM messages WHERE sender_id = ? AND recipient_id = ? AND status < 2 AND ${live}`,
+      [partnerId, req.user.id, now]
+    );
     if (pending.length) {
-      db.prepare(
-        `UPDATE messages SET status = 2 WHERE sender_id = ? AND recipient_id = ? AND status < 2 AND ${live}`
-      ).run(partnerId, req.user.id, now);
+      await dbRun(
+        `UPDATE messages SET status = 2 WHERE sender_id = ? AND recipient_id = ? AND status < 2 AND ${live}`,
+        [partnerId, req.user.id, now]
+      );
       for (const m of pending) {
         sendToUser(partnerId, {
           type: 'receipt',
@@ -1641,13 +1707,13 @@ app.get('/api/messages/:partnerId', requireAuth, (req, res) => {
     messages: rows.map(toClientMessage),
     hasMore: before ? rows.length === limit : false,
   });
-});
+}));
 
 // --- SPA fallback (API routes above take precedence)
-app.get('*', (req, res, next) => {
+app.get('*', ah(async (req, res, next) => {
   if (req.path.startsWith('/api/') || req.path === '/ws') return next();
   res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
-});
+}));
 
 // JSON error responses for oversized bodies (no stack/path leaks).
 // eslint-disable-next-line no-unused-vars
@@ -1655,7 +1721,10 @@ app.use((err, req, res, next) => {
   if (err && (err.status === 413 || err.type === 'entity.too.large')) {
     return res.status(413).json({ error: 'payload_too_large', message: 'Request body is too large.' });
   }
-  next(err);
+  console.error('[server] unhandled error:', (err && err.message) || err);
+  if (!res.headersSent) {
+    res.status(422).json({ error: 'server_error', message: 'Something went wrong.' });
+  }
 });
 
 // ---------------------------------------------------------------- websocket
@@ -1681,8 +1750,8 @@ function sendToUser(userId, obj) {
 }
 
 // Block-aware delivery: never relay anything to a recipient who blocked the sender.
-function deliverTo(recipientId, senderId, obj) {
-  if (isBlocked(recipientId, senderId)) return false; // drop silently
+async function deliverTo(recipientId, senderId, obj) {
+  if (await isBlocked(recipientId, senderId)) return false; // drop silently
   return sendToUser(recipientId, obj);
 }
 
@@ -1701,16 +1770,21 @@ function onlineIds() {
 }
 
 // Accept a numeric user id or a username string.
-function resolveRecipient(to) {
-  if (typeof to === 'number' && Number.isInteger(to) && to > 0) return getUserById(to);
-  if (typeof to === 'string' && to.trim()) return getUserByUsername(to);
+async function resolveRecipient(to) {
+  if (typeof to === 'number' && Number.isInteger(to) && to > 0) return await getUserById(to);
+  if (typeof to === 'string' && to.trim()) return await getUserByUsername(to);
   return null;
 }
 
 const CALL_TYPES = new Set(['call-offer', 'call-answer', 'ice-candidate', 'call-reject', 'call-hangup']);
 
-wss.on('connection', (ws, req) => {
-  const user = getUserFromWs(req);
+wss.on('connection', async (ws, req) => {
+  let user = null;
+  try {
+    user = await getUserFromWs(req);
+  } catch (e) {
+    console.error('[ws] auth lookup failed:', (e && e.message) || e);
+  }
   if (!user) {
     ws.close(4401, 'unauthorized');
     return;
@@ -1721,7 +1795,7 @@ wss.on('connection', (ws, req) => {
   online.get(userId).add(ws);
   ws.userId = userId;
   try {
-    db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').run(Date.now(), userId);
+    (await dbRun('UPDATE users SET last_seen = ? WHERE id = ?', [Date.now(), userId]));
   } catch {
     /* non-fatal */
   }
@@ -1731,35 +1805,39 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ type: 'init', me: { id: user.id, username: user.username }, online: onlineIds() }));
 
   // Anything queued for this user while offline counts as delivered now.
-  const now0 = Date.now();
-  const queued = db
-    .prepare(
-      'SELECT id, sender_id FROM messages WHERE recipient_id = ? AND status = 0 AND (expire_at IS NULL OR expire_at > ?)'
-    )
-    .all(userId, now0);
-  if (queued.length) {
-    db.prepare('UPDATE messages SET status = 1 WHERE recipient_id = ? AND status = 0').run(userId);
-    const bySender = new Map();
-    for (const m of queued) {
-      if (!bySender.has(m.sender_id)) bySender.set(m.sender_id, []);
-      bySender.get(m.sender_id).push(m.id);
+  try {
+    const now0 = Date.now();
+    const queued = await dbAll(
+      'SELECT id, sender_id FROM messages WHERE recipient_id = ? AND status = 0 AND (expire_at IS NULL OR expire_at > ?)',
+      [userId, now0]
+    );
+    if (queued.length) {
+      (await dbRun('UPDATE messages SET status = 1 WHERE recipient_id = ? AND status = 0', [userId]));
+      const bySender = new Map();
+      for (const m of queued) {
+        if (!bySender.has(m.sender_id)) bySender.set(m.sender_id, []);
+        bySender.get(m.sender_id).push(m.id);
+      }
+      for (const [senderId, ids] of bySender) {
+        sendToUser(senderId, { type: 'receipt', by: userId, ids, status: 1 });
+      }
     }
-    for (const [senderId, ids] of bySender) {
-      sendToUser(senderId, { type: 'receipt', by: userId, ids, status: 1 });
-    }
+  } catch (e) {
+    console.error('[ws] queued delivery failed:', (e && e.message) || e);
   }
 
-  ws.on('message', (raw) => {
-    let msg;
+  ws.on('message', async (raw) => {
     try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
 
     // ---- 1:1 send (text | image | audio | location, optional ttl) ---------
     if (msg.type === 'send') {
-      const partner = resolveRecipient(msg.to);
+      const partner = await resolveRecipient(msg.to);
       if (!partner || partner.id === userId) return;
 
       const content = parseRichContent(msg);
@@ -1770,8 +1848,8 @@ wss.on('connection', (ws, req) => {
       if (!content) return;
 
       // Persist always; deliver only if the recipient hasn't blocked us.
-      const m = insertMessage(userId, partner.id, content);
-      const blocked = isBlocked(partner.id, userId);
+      const m = await insertMessage(userId, partner.id, content);
+      const blocked = await isBlocked(partner.id, userId);
       let delivered = false;
       if (!blocked) {
         delivered = sendToUser(partner.id, {
@@ -1781,7 +1859,7 @@ wss.on('connection', (ws, req) => {
         });
       }
       if (delivered) {
-        db.prepare('UPDATE messages SET status = 1 WHERE id = ?').run(m.id);
+        (await dbRun('UPDATE messages SET status = 1 WHERE id = ?', [m.id]));
         m.status = 1;
       }
       ws.send(JSON.stringify({ type: 'sent', tempId: msg.tempId || null, message: toClientMessage(m) }));
@@ -1793,16 +1871,16 @@ wss.on('connection', (ws, req) => {
       const fromId = Number(msg.from);
       if (!Number.isInteger(fromId) || fromId <= 0) return;
       const now = Date.now();
-      const pending = db
-        .prepare(
-          'SELECT id FROM messages WHERE sender_id = ? AND recipient_id = ? AND status < 2 AND (expire_at IS NULL OR expire_at > ?)'
-        )
-        .all(fromId, userId, now);
+      const pending = await dbAll(
+        'SELECT id FROM messages WHERE sender_id = ? AND recipient_id = ? AND status < 2 AND (expire_at IS NULL OR expire_at > ?)',
+        [fromId, userId, now]
+      );
       if (pending.length) {
-        db.prepare(
-          'UPDATE messages SET status = 2 WHERE sender_id = ? AND recipient_id = ? AND status < 2'
-        ).run(fromId, userId);
-        deliverTo(fromId, userId, {
+        await dbRun('UPDATE messages SET status = 2 WHERE sender_id = ? AND recipient_id = ? AND status < 2', [
+          fromId,
+          userId,
+        ]);
+        await deliverTo(fromId, userId, {
           type: 'receipt',
           by: userId,
           ids: pending.map((r) => r.id),
@@ -1814,20 +1892,20 @@ wss.on('connection', (ws, req) => {
 
     // ---- typing ------------------------------------------------------------
     if (msg.type === 'typing') {
-      const partner = resolveRecipient(msg.to);
+      const partner = await resolveRecipient(msg.to);
       if (!partner) return;
-      deliverTo(partner.id, userId, { type: 'typing', from: userId, typing: !!msg.typing });
+      await deliverTo(partner.id, userId, { type: 'typing', from: userId, typing: !!msg.typing });
       return;
     }
 
     // ---- reactions ----------------------------------------------------------
     // {type:"reaction", to, from, msgId, emoji} → persist + relay.
     if (msg.type === 'reaction') {
-      const partner = resolveRecipient(msg.to);
+      const partner = await resolveRecipient(msg.to);
       const msgId = Number(msg.msgId);
       const emoji = String(msg.emoji || '').trim();
       if (!partner || !Number.isInteger(msgId) || !emoji || [...emoji].length > 8) return;
-      const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(msgId);
+      const m = (await dbGet('SELECT * FROM messages WHERE id = ?', [msgId]));
       if (!m) return;
       if (m.sender_id !== userId && m.recipient_id !== userId) return; // not our chat
       const reactions = parseReactions(m.reactions);
@@ -1838,9 +1916,9 @@ wss.on('connection', (ws, req) => {
       } else {
         reactions[emoji] = [...list, user.username];
       }
-      db.prepare('UPDATE messages SET reactions = ? WHERE id = ?').run(JSON.stringify(reactions), msgId);
+      (await dbRun('UPDATE messages SET reactions = ? WHERE id = ?', [JSON.stringify(reactions), msgId]));
       const otherId = m.sender_id === userId ? m.recipient_id : m.sender_id;
-      deliverTo(otherId, userId, {
+      await deliverTo(otherId, userId, {
         type: 'reaction',
         from: user.username,
         msgId,
@@ -1855,8 +1933,8 @@ wss.on('connection', (ws, req) => {
     if (msg.type === 'group-message') {
       const groupId = Number(msg.groupId);
       if (!Number.isInteger(groupId) || groupId <= 0) return;
-      const group = db.prepare('SELECT id FROM groups WHERE id = ?').get(groupId);
-      if (!group || !isMember(groupId, userId)) return;
+      const group = (await dbGet('SELECT id FROM groups WHERE id = ?', [groupId]));
+      if (!group || !await isMember(groupId, userId)) return;
 
       const content = parseRichContent(msg);
       if (content === 'too_large') {
@@ -1865,7 +1943,7 @@ wss.on('connection', (ws, req) => {
       }
       if (!content) return;
 
-      const gm = insertGroupMessage(groupId, userId, content);
+      const gm = await insertGroupMessage(groupId, userId, content);
       const clientMsg = toClientGroupMessage(gm, user.username);
       const payload = {
         type: 'group-message',
@@ -1874,9 +1952,9 @@ wss.on('connection', (ws, req) => {
         fromId: userId,
         message: clientMsg,
       };
-      for (const member of groupMemberRows(groupId)) {
+      for (const member of await groupMemberRows(groupId)) {
         if (member.id === userId) continue;
-        deliverTo(member.id, userId, payload); // block-aware: skips members who blocked us
+        await deliverTo(member.id, userId, payload); // block-aware: skips members who blocked us
       }
       ws.send(JSON.stringify({ type: 'sent', tempId: msg.tempId || null, groupId, message: clientMsg }));
       return;
@@ -1885,9 +1963,9 @@ wss.on('connection', (ws, req) => {
     // ---- call signaling relay (server never touches media) ------------------
     // call-offer / call-answer / ice-candidate / call-reject / call-hangup
     if (CALL_TYPES.has(msg.type)) {
-      const target = resolveRecipient(msg.to);
+      const target = await resolveRecipient(msg.to);
       if (!target || target.id === userId) return;
-      if (isBlocked(target.id, userId)) return; // blocked → drop silently, no reply
+      if (await isBlocked(target.id, userId)) return; // blocked → drop silently, no reply
       const payload = { type: msg.type, from: user.username, to: target.username };
       if (msg.sdp !== undefined) payload.sdp = msg.sdp;
       if (msg.candidate !== undefined) payload.candidate = msg.candidate;
@@ -1898,16 +1976,19 @@ wss.on('connection', (ws, req) => {
       }
       return;
     }
+    } catch (e) {
+      console.error('[ws] message handler error:', (e && e.message) || e);
+    }
   });
 
-  const onClose = () => {
+  const onClose = async () => {
     const set = online.get(userId);
     if (set) {
       set.delete(ws);
       if (set.size === 0) {
         online.delete(userId);
         try {
-          db.prepare('UPDATE users SET last_seen = ? WHERE id = ?').run(Date.now(), userId);
+          (await dbRun('UPDATE users SET last_seen = ? WHERE id = ?', [Date.now(), userId]));
         } catch {
           /* non-fatal */
         }
@@ -1922,7 +2003,7 @@ wss.on('connection', (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.3 listening on port ${PORT} (db: ${DB_PATH})`);
+  console.log(`Chatly v3.4 listening on port ${PORT} (db: ${DB_BACKEND})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
