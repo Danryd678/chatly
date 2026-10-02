@@ -375,6 +375,13 @@ SMTP_PASS=********
 SMTP_FROM=Chatly <you@example.com>   # optional, defaults to SMTP_USER
 
 GOOGLE_CLIENT_ID=1234567890-abc.apps.googleusercontent.com   # for Google sign-in
+
+# Database (v3.4+): Turso hosted SQLite — REQUIRED in production because
+# Faable's disk is ephemeral (wiped on every restart/deploy/sleep).
+TURSO_URL=libsql://chatly-xxxx.turso.io
+TURSO_AUTH_TOKEN=********
+# When TURSO_URL is unset the server falls back to a local SQLite file
+# (DB_PATH, default ./data/chatly.db) — fine for dev/tests only.
 ```
 
 **Email is always genuinely delivered** via nodemailer + the SMTP settings
@@ -391,7 +398,10 @@ Google sign-in answers `422 {error:"google_not_configured"}` until
 
 ## 9. Database notes
 
-SQLite (`node:sqlite`), file at `data/chatly.db` (`DB_PATH` env overrides).
+SQLite via libsql (`@libsql/client`). **Production must set `TURSO_URL` (+
+`TURSO_AUTH_TOKEN`)**: the hosting disk is ephemeral, so a local SQLite file
+(`DB_PATH`, default `data/chatly.db`) is wiped on every restart/deploy —
+only suitable for dev/tests. Same SQL dialect in both modes.
 v3 migrations run automatically on boot via `ALTER TABLE` guards, so existing
 databases upgrade in place:
 
