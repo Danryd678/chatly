@@ -673,7 +673,7 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.5.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.6.0' })));
 
 // --- accounts -------------------------------------------------------------
 
@@ -790,6 +790,7 @@ app.post('/api/login', rateLimit('login', 20), ah(async (req, res) => {
     token,
     username: row.username,
     user: { id: row.id, username: row.username },
+    id: row.id,
   });
 }));
 
@@ -1331,15 +1332,28 @@ app.get('/api/groups/:id/history', ah(async (req, res) => {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
+  const after = Number(req.query.after || 0);
   const now = Date.now();
-  const rows = await dbAll(
-    `SELECT gm.*, u.username AS sender_username FROM group_messages gm
-     JOIN users u ON u.id = gm.sender_id
-     WHERE gm.group_id = ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
-     ORDER BY gm.id DESC LIMIT ?`,
-    [gid, now, limit]
-  );
-  rows.reverse();
+  let rows;
+  if (after > 0) {
+    // v3.6: incremental poll for messages newer than `after` (fallback when WS drops).
+    rows = await dbAll(
+      `SELECT gm.*, u.username AS sender_username FROM group_messages gm
+       JOIN users u ON u.id = gm.sender_id
+       WHERE gm.group_id = ? AND gm.id > ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
+       ORDER BY gm.id ASC LIMIT ?`,
+      [gid, after, now, limit]
+    );
+  } else {
+    rows = await dbAll(
+      `SELECT gm.*, u.username AS sender_username FROM group_messages gm
+       JOIN users u ON u.id = gm.sender_id
+       WHERE gm.group_id = ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
+       ORDER BY gm.id DESC LIMIT ?`,
+      [gid, now, limit]
+    );
+    rows.reverse();
+  }
   const blocked = await blockedIds(user.id);
   res.json({
     groupId: gid,
@@ -1362,6 +1376,7 @@ async function toClientStatus(s) {
   const u = await getUserById(s.user_id);
   return {
     statusId: s.id,
+    userId: s.user_id,
     username: u ? u.username : null,
     name: u ? u.display_name || u.username : null,
     avatar: u ? u.avatar || null : null,
@@ -1670,6 +1685,7 @@ app.get('/api/chats', requireAuth, ah(async (req, res) => {
 app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
   const partnerId = Number(req.params.partnerId);
   const before = Number(req.query.before || 0);
+  const after = Number(req.query.after || 0);
   const limit = Math.min(Number(req.query.limit || 50), 100);
   const now = Date.now();
   const live = '(expire_at IS NULL OR expire_at > ?)';
@@ -1679,7 +1695,18 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
   }
   let rows;
   const convo = `((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) AND ${live}`;
-  if (before > 0) {
+  if (after > 0) {
+    // v3.6: incremental poll for messages newer than `after` (fallback when WS drops).
+    rows = await dbAll(`SELECT * FROM messages WHERE ${convo} AND id > ? ORDER BY id ASC LIMIT ?`, [
+      req.user.id,
+      partnerId,
+      partnerId,
+      req.user.id,
+      now,
+      after,
+      limit,
+    ]);
+  } else if (before > 0) {
     rows = await dbAll(`SELECT * FROM messages WHERE ${convo} AND id < ? ORDER BY id DESC LIMIT ?`, [
       req.user.id,
       partnerId,
@@ -1862,13 +1889,32 @@ wss.on('connection', async (ws, req) => {
   ws.send(JSON.stringify({ type: 'init', me: { id: user.id, username: user.username }, online: onlineIds() }));
 
   // Anything queued for this user while offline counts as delivered now.
+  // FIX (v3.6): actually PUSH the undelivered message content to the reconnecting
+  // client — previously we only marked them delivered and sent receipts, so a
+  // recipient whose socket had silently died never received the bodies.
   try {
     const now0 = Date.now();
     const queued = await dbAll(
-      'SELECT id, sender_id FROM messages WHERE recipient_id = ? AND status = 0 AND (expire_at IS NULL OR expire_at > ?)',
+      'SELECT * FROM messages WHERE recipient_id = ? AND status = 0 AND (expire_at IS NULL OR expire_at > ?) ORDER BY id ASC LIMIT 50',
       [userId, now0]
     );
     if (queued.length) {
+      const blockedBy = new Map();
+      for (const m of queued) {
+        let blocked = blockedBy.get(m.sender_id);
+        if (blocked === undefined) {
+          blocked = await isBlocked(userId, m.sender_id);
+          blockedBy.set(m.sender_id, blocked);
+        }
+        if (blocked) continue;
+        const sender = await getUserById(m.sender_id);
+        sendToUser(userId, {
+          type: 'message',
+          from: m.sender_id,
+          fromName: sender ? sender.username : null,
+          message: { ...toClientMessage(m), from: m.sender_id },
+        });
+      }
       (await dbRun('UPDATE messages SET status = 1 WHERE recipient_id = ? AND status = 0', [userId]));
       const bySender = new Map();
       for (const m of queued) {
@@ -2060,7 +2106,7 @@ wss.on('connection', async (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.5 listening on port ${PORT} (db: ${DB_BACKEND})`);
+  console.log(`Chatly v3.6 listening on port ${PORT} (db: ${DB_BACKEND})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
