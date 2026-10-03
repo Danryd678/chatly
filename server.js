@@ -38,7 +38,7 @@ import express from 'express';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { createClient } from '@libsql/client';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scryptSync, timingSafeEqual, createVerify } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import nodemailer from 'nodemailer';
@@ -69,6 +69,11 @@ const smtpConfigured = () => Boolean(SMTP.host && SMTP.user && SMTP.pass);
 // Google sign-in: the Android app's OAuth client ID. Verified against the
 // `aud` claim of Google's ID tokens. Missing → /api/auth/google answers 503.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+
+// Firebase phone auth: the Firebase project ID. Verified against the `aud`
+// and `iss` claims of Firebase ID tokens. Missing → /api/auth/phone answers
+// 422. Juliana sets this in Faable Variables.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || '';
 
 // NOTE (2026-10-01): mail/config problems answer HTTP 422 (not 503/502): the
 // hosting edge proxy swallows 5xx responses and substitutes its own error
@@ -168,6 +173,18 @@ async function initDb() {
 // --- v3.5 migrations: view-once media ---------------------------------------
   await ensureColumn('messages', 'view_once', 'INTEGER NOT NULL DEFAULT 0'); // 1 = view-once image/voice
   await ensureColumn('messages', 'viewed_at', 'INTEGER'); // epoch ms when the recipient viewed it
+
+// --- v3.8 migrations: passwordless auth (phone + email-code) ----------------
+  await ensureColumn('users', 'phone', 'TEXT'); // E.164 phone for Firebase phone auth
+  await db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
+// SQLite allows many NULLs in a UNIQUE index, so accounts without a phone
+// coexist fine.
+  await db.execute(`
+  CREATE TABLE IF NOT EXISTS auth_codes (
+    email TEXT PRIMARY KEY,
+    code TEXT NOT NULL,
+    expiry INTEGER NOT NULL
+  );`);
 
 // --- v3.0: groups ----------------------------------------------------------
   await db.executeMultiple(`
@@ -410,6 +427,119 @@ const getUserByEmail = async (email) =>
 
 const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
 
+// ---- passwordless auth helpers (v3.8) -------------------------------------
+// Find-or-create a user by verified email. Shared by Google sign-in and
+// email-code sign-in: the same email always maps to the same account.
+async function findOrCreateUserByEmail(email) {
+  const mail = normalizeEmail(email);
+  let user = await getUserByEmail(mail);
+  if (!user) {
+    let base = mail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20) || 'user';
+    if (!USERNAME_RE.test(base)) base = 'user';
+    let candidate = base;
+    for (let n = 1; await getUserByUsername(candidate); n++) candidate = `${base}${n}`.slice(0, 20);
+    // Passwordless accounts get a random, unusable password hash and are
+    // verified from the start (the email was verified by Google or by code).
+    await dbRun(
+      'INSERT INTO users (username, password_hash, created_at, email, verified) VALUES (?, ?, ?, ?, 1)',
+      [candidate, `passwordless:${randomBytes(16).toString('hex')}`, Date.now(), mail]
+    );
+    user = await getUserByUsername(candidate);
+  }
+  return user;
+}
+
+// Find-or-create a user by verified phone number (Firebase phone auth).
+async function findOrCreateUserByPhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  let user = await dbGet('SELECT * FROM users WHERE phone = ?', [String(phone)]);
+  if (!user) {
+    let base = ('user' + digits.slice(-6)).slice(0, 20) || 'user';
+    if (!USERNAME_RE.test(base)) base = 'user';
+    let candidate = base;
+    for (let n = 1; await getUserByUsername(candidate); n++) candidate = `${base}${n}`.slice(0, 20);
+    await dbRun(
+      'INSERT INTO users (username, password_hash, created_at, phone, verified) VALUES (?, ?, ?, ?, 1)',
+      [candidate, `passwordless:${randomBytes(16).toString('hex')}`, Date.now(), String(phone)]
+    );
+    user = await getUserByUsername(candidate);
+  }
+  return user;
+}
+
+// Firebase ID token verification (manual RS256, no extra dependency).
+// Firebase ID tokens are JWTs signed by Google. We fetch Google's public
+// certs, verify the signature, and check aud/iss/exp.
+let firebaseCerts = null;
+let firebaseCertsFetchedAt = 0;
+async function getFirebaseCerts() {
+  const now = Date.now();
+  if (firebaseCerts && now - firebaseCertsFetchedAt < 3600000) return firebaseCerts;
+  const r = await fetch(
+    'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com',
+    { signal: AbortSignal.timeout(10000) }
+  );
+  if (!r.ok) throw new Error('cert_fetch_failed');
+  firebaseCerts = await r.json();
+  firebaseCertsFetchedAt = now;
+  return firebaseCerts;
+}
+
+function base64urlDecode(str) {
+  let b64 = String(str || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  return Buffer.from(b64, 'base64');
+}
+
+// Returns the decoded payload on success. Throws {status, error, message} on
+// failure (caught by the route and turned into a JSON response, never a 500).
+async function verifyFirebaseToken(idToken) {
+  if (!FIREBASE_PROJECT_ID) {
+    throw { status: 422, error: 'phone_not_configured', message: 'Phone sign-in is not configured on this server yet.' };
+  }
+  if (typeof idToken !== 'string' || !idToken) {
+    throw { status: 400, error: 'bad_request', message: 'idToken is required.' };
+  }
+  const parts = idToken.split('.');
+  if (parts.length !== 3) throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  const [headerB64, payloadB64, sigB64] = parts;
+  let header, payload;
+  try {
+    header = JSON.parse(base64urlDecode(headerB64).toString());
+    payload = JSON.parse(base64urlDecode(payloadB64).toString());
+  } catch {
+    throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  }
+  if (header.alg !== 'RS256') throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  let certs;
+  try {
+    certs = await getFirebaseCerts();
+  } catch (e) {
+    console.error('[auth] firebase certs unreachable:', (e && e.message) || e);
+    throw { status: 422, error: 'google_unreachable', message: 'Could not reach Google to verify the token.' };
+  }
+  const cert = certs[header.kid];
+  if (!cert) throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  const verifier = createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  let sigOk = false;
+  try {
+    sigOk = verifier.verify(cert, base64urlDecode(sigB64));
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (payload.aud !== FIREBASE_PROJECT_ID) throw { status: 401, error: 'invalid_audience', message: 'Token was not issued for this app.' };
+  if (payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) {
+    throw { status: 401, error: 'invalid_issuer', message: 'That sign-in token is not valid.' };
+  }
+  if (!payload.sub || typeof payload.sub !== 'string') throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  if (payload.exp && payload.exp < nowSec) throw { status: 401, error: 'expired_token', message: 'That sign-in token expired. Try again.' };
+  if (payload.iat && payload.iat > nowSec + 300) throw { status: 401, error: 'invalid_token', message: 'That sign-in token is not valid.' };
+  return payload;
+}
+
 async function blockedIds(userId) {
   const row = (await dbGet('SELECT blocked FROM users WHERE id = ?', [userId]));
   try {
@@ -502,6 +632,9 @@ async function sendMail(to, subject, text) {
 
 const verifyEmailText = (code) =>
   `Welcome to Chatly!\n\nYour verification code is: ${code}\n\nIt expires in 10 minutes.\nIf you didn't create a Chatly account, just ignore this email.`;
+
+const signInEmailText = (code) =>
+  `Your Chatly sign-in code is: ${code}\n\nIt expires in 10 minutes.\nIf you didn't try to sign in, just ignore this email.`;
 
 const resetEmailText = (code) =>
   `You asked to reset your Chatly password.\n\nYour reset code is: ${code}\n\nIt expires in 10 minutes.\nIf you didn't ask for this, just ignore this email — your password stays the same.`;
@@ -681,7 +814,7 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.7.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.8.0' })));
 
 // Public download page (no login needed): Android APK + iPhone web-app guide.
 app.get('/download', (req, res) => res.sendFile(path.join(process.cwd(), 'public', 'download.html')));
@@ -845,9 +978,11 @@ app.post('/api/me', ah(selfProfileHandler));
 
 // POST /api/auth/google {idToken, username?} — Google sign-in.
 // Verifies the ID token with Google, requires aud == GOOGLE_CLIENT_ID and
-// email_verified. Find-or-create by email; new users get a unique username
-// (requested one if valid+free, else derived from the email prefix).
-// 503 {error:"google_not_configured"} when GOOGLE_CLIENT_ID is missing.
+// email_verified. Find-or-create by email (shared helper: the same email
+// always maps to the same account, whether it came from Google or email-code
+// sign-in). New users get a unique username (requested one if valid+free,
+// else derived from the email prefix).
+// 422 {error:"google_not_configured"} when GOOGLE_CLIENT_ID is missing.
 app.post('/api/auth/google', rateLimit('google', 20), ah(async (req, res) => {
   if (!GOOGLE_CLIENT_ID) {
     return res.status(422).json({
@@ -885,26 +1020,117 @@ app.post('/api/auth/google', rateLimit('google', 20), ah(async (req, res) => {
   }
   let user = await getUserByEmail(email);
   if (!user) {
-    let name = String(username || '').trim();
-    if (!name || !USERNAME_RE.test(name) || await getUserByUsername(name)) name = '';
-    if (!name) {
-      let base = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20) || 'user';
-      if (!USERNAME_RE.test(base)) base = 'user';
-      let candidate = base;
-      for (let n = 1; await getUserByUsername(candidate); n++) candidate = `${base}${n}`.slice(0, 20);
-      name = candidate;
+    // Honor a requested username for brand-new accounts when valid and free.
+    const wanted = String(username || '').trim();
+    if (wanted && USERNAME_RE.test(wanted) && !(await getUserByUsername(wanted))) {
+      await dbRun(
+        'INSERT INTO users (username, password_hash, created_at, email, verified) VALUES (?, ?, ?, ?, 1)',
+        [wanted, `passwordless:${randomBytes(16).toString('hex')}`, Date.now(), email]
+      );
+      user = await getUserByUsername(wanted);
+    } else {
+      user = await findOrCreateUserByEmail(email);
     }
-    // Google-only accounts get a random, unusable password hash and are
-    // verified from the start (Google already verified the email).
-    await dbRun(
-      'INSERT INTO users (username, password_hash, created_at, email, verified) VALUES (?, ?, ?, ?, 1)',
-      [name, `google:${randomBytes(16).toString('hex')}`, Date.now(), email]
-    );
-    user = await getUserByUsername(name);
   }
   const token = await newSession(user.id);
   setSessionCookie(res, token);
-  res.json({ ok: true, token, username: user.username });
+  res.json({
+    ok: true,
+    token,
+    username: user.username, // legacy top-level shape kept for old clients
+    user: { id: user.id, username: user.username, email: user.email },
+  });
+}));
+
+// POST /api/auth/email/start {email} — passwordless email sign-in, step 1.
+// Sends a 6-digit code (10 min) to the address. The address does NOT need an
+// existing account; verifying the code creates one (step 2).
+// 422 {error:"email_not_configured"} when SMTP is missing. 429 when a code was
+// sent to this address within the last 60s.
+app.post('/api/auth/email/start', rateLimit('auth-email-start', 10), ah(async (req, res) => {
+  const mail = normalizeEmail(req.body && req.body.email);
+  if (!mail || !EMAIL_RE.test(mail)) {
+    return res.status(400).json({ error: 'invalid_email', message: 'That email address looks invalid.' });
+  }
+  const now = Date.now();
+  const last = lastCodeSent.get(mail) || 0;
+  if (now - last < 60000) {
+    return res.status(429).json({
+      error: 'too_soon',
+      message: 'A code was just sent. Wait a minute before requesting another.',
+      retryAfter: Math.ceil((60000 - (now - last)) / 1000),
+    });
+  }
+  if (!smtpConfigured()) {
+    return res.status(422).json({ error: 'email_not_configured', message: 'Email is not configured on this server yet.' });
+  }
+  const code = genCode();
+  await dbRun(
+    'INSERT INTO auth_codes (email, code, expiry) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET code = excluded.code, expiry = excluded.expiry',
+    [mail, code, now + CODE_TTL_MS]
+  );
+  try {
+    await sendMail(mail, 'Your Chatly sign-in code', signInEmailText(code));
+  } catch (e) {
+    logMailError('auth/email/start', e);
+    if (e.code === 'email_not_configured') return res.status(422).json({ error: 'email_not_configured' });
+    return res.status(422).json({ error: 'email_send_failed', message: 'Could not send the email. Try again.' });
+  }
+  lastCodeSent.set(mail, now);
+  res.json({ ok: true, message: 'Code sent. Check your inbox.' });
+}));
+
+// POST /api/auth/email/verify {email, code} — passwordless email sign-in,
+// step 2. Verifies the code, then finds or creates the account for the email
+// (shared with Google sign-in: same email = same account).
+app.post('/api/auth/email/verify', rateLimit('auth-email-verify', 20), ah(async (req, res) => {
+  const { email, code } = req.body || {};
+  const mail = normalizeEmail(email);
+  const codeStr = String(code || '').trim();
+  if (!mail || !EMAIL_RE.test(mail)) {
+    return res.status(400).json({ error: 'invalid_email', message: 'That email address looks invalid.' });
+  }
+  if (!codeStr) {
+    return res.status(400).json({ error: 'bad_code', message: 'Verification code required.' });
+  }
+  const row = await dbGet('SELECT * FROM auth_codes WHERE email = ?', [mail]);
+  if (!row || row.code !== codeStr) {
+    return res.status(400).json({ error: 'bad_code', message: 'Wrong verification code.' });
+  }
+  if (row.expiry < Date.now()) {
+    await dbRun('DELETE FROM auth_codes WHERE email = ?', [mail]);
+    return res.status(400).json({ error: 'expired', message: 'That code expired. Request a new one.' });
+  }
+  await dbRun('DELETE FROM auth_codes WHERE email = ?', [mail]);
+  const user = await findOrCreateUserByEmail(mail);
+  const token = await newSession(user.id);
+  setSessionCookie(res, token);
+  res.json({ ok: true, token, user: { id: user.id, username: user.username, email: user.email } });
+}));
+
+// POST /api/auth/phone {idToken} — Firebase phone sign-in.
+// Verifies the Firebase ID token (RS256, Google certs), extracts the verified
+// phone_number claim, and finds or creates the account for it.
+// 422 {error:"phone_not_configured"} when FIREBASE_PROJECT_ID is missing.
+app.post('/api/auth/phone', rateLimit('auth-phone', 20), ah(async (req, res) => {
+  const { idToken } = req.body || {};
+  let payload;
+  try {
+    payload = await verifyFirebaseToken(idToken);
+  } catch (e) {
+    if (e && e.status) {
+      return res.status(e.status).json({ error: e.error, message: e.message || 'Sign-in failed.' });
+    }
+    throw e;
+  }
+  const phone = String(payload.phone_number || '').trim();
+  if (!phone) {
+    return res.status(400).json({ error: 'no_phone', message: 'This sign-in needs a verified phone number.' });
+  }
+  const user = await findOrCreateUserByPhone(phone);
+  const token = await newSession(user.id);
+  setSessionCookie(res, token);
+  res.json({ ok: true, token, user: { id: user.id, username: user.username, phone: user.phone } });
 }));
 
 // POST /api/verify-email {email, code} → {ok:true}
@@ -2192,7 +2418,7 @@ wss.on('connection', async (ws, req) => {
 // ---------------------------------------------------------------- start
 
 server.listen(PORT, () => {
-  console.log(`Chatly v3.7 listening on port ${PORT} (db: ${DB_BACKEND})`);
+  console.log(`Chatly v3.8 listening on port ${PORT} (db: ${DB_BACKEND})`);
   console.log(`Email sending: ${smtpConfigured() ? 'configured' : 'NOT configured (SMTP_* env vars missing)'}`);
 });
 
