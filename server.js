@@ -211,6 +211,13 @@ async function initDb() {
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     PRIMARY KEY (group_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS group_invites (
+    code TEXT PRIMARY KEY,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+  );
   CREATE TABLE IF NOT EXISTS group_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -684,6 +691,7 @@ function toClientMessage(m) {
   const o = {
     id: m.id,
     senderId: m.sender_id,
+    sender: m.sender_username || m.sender || '',
     kind: m.kind || 'text',
     body: m.body,
     data: m.data || null,
@@ -826,7 +834,7 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.9.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '4.0.0' })));
 
 // Public download page (no login needed): Android APK + iPhone web-app guide.
 app.get('/download', (req, res) => res.sendFile(path.join(process.cwd(), 'public', 'download.html')));
@@ -1574,6 +1582,55 @@ app.post('/api/groups/:id/remove', ah(async (req, res) => {
     return res.json({ ok: true, deleted: true });
   }
   res.json(await groupSummary(gid));
+}));
+
+// POST /api/groups/:id/invite — generate an invite link code (any member can invite).
+app.post('/api/groups/:id/invite', rateLimit('group-invite', 20), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const gid = Number(req.params.id);
+  if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
+    return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+  }
+  const code = require('crypto').randomBytes(8).toString('hex');
+  await dbRun('INSERT INTO group_invites (code, group_id, creator_id, created_at) VALUES (?, ?, ?, ?)',
+    [code, gid, user.id, Date.now()]);
+  const g = await groupSummary(gid);
+  res.json({ ok: true, code, link: 'https://chatly-4vsww.faable.link/join-group/' + gid + '?code=' + code, groupName: g ? g.name : '' });
+}));
+
+// POST /api/groups/join {code} — join a group via invite code.
+app.post('/api/groups/join', rateLimit('group-join', 20), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const code = String((req.body && req.body.code) || '').trim();
+  if (!code) return res.status(400).json({ error: 'bad_request', message: 'Invite code required.' });
+  const inv = await dbGet('SELECT * FROM group_invites WHERE code = ?', [code]);
+  if (!inv) return res.status(404).json({ error: 'invalid_code', message: 'This invite link is invalid.' });
+  const g = await groupSummary(inv.group_id);
+  if (!g) return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+  if (await isMember(inv.group_id, user.id)) {
+    return res.json({ ok: true, already: true, group: g });
+  }
+  await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)', [inv.group_id, user.id]);
+  await dbRun('UPDATE group_invites SET uses = uses + 1 WHERE code = ?', [code]);
+  res.json({ ok: true, group: await groupSummary(inv.group_id) });
+}));
+
+// POST /api/change-username {username} — change own username (unique, 3-20 chars, alphanumeric+underscore).
+app.post('/api/change-username', rateLimit('change-username', 10), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const name = String((req.body && req.body.username) || '').trim();
+  if (!/^[A-Za-z0-9_]{3,20}$/.test(name)) {
+    return res.status(400).json({ error: 'invalid_username', message: 'Username must be 3-20 characters (letters, numbers, underscore).' });
+  }
+  const existing = await dbGet('SELECT id FROM users WHERE LOWER(username) = LOWER(?)', [name]);
+  if (existing && existing.id !== user.id) {
+    return res.status(409).json({ error: 'taken', message: 'That username is already taken.' });
+  }
+  await dbRun('UPDATE users SET username = ? WHERE id = ?', [name, user.id]);
+  res.json({ ok: true, username: name });
 }));
 
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,
@@ -2359,11 +2416,13 @@ wss.on('connection', async (ws, req) => {
         }
         if (blocked) continue;
         const sender = await getUserById(m.sender_id);
+        const senderName = sender ? sender.username : null;
         sendToUser(userId, {
           type: 'message',
           from: m.sender_id,
-          fromName: sender ? sender.username : null,
-          message: { ...toClientMessage(m), from: m.sender_id },
+          fromName: senderName,
+          sender: senderName,
+          message: { ...toClientMessage(m), from: m.sender_id, sender: senderName },
         });
       }
       (await dbRun('UPDATE messages SET status = 1 WHERE recipient_id = ? AND status = 0', [userId]));
@@ -2408,8 +2467,10 @@ wss.on('connection', async (ws, req) => {
       if (!blocked) {
         delivered = sendToUser(partner.id, {
           type: 'message',
+          from: userId,
           fromName: user.username,
-          message: { ...toClientMessage(m), from: userId },
+          sender: user.username,
+          message: { ...toClientMessage(m), from: userId, sender: user.username },
         });
       }
       if (delivered) {
