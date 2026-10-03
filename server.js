@@ -198,6 +198,25 @@ async function initDb() {
     PRIMARY KEY (user_id, message_id, scope)
   );`);
 
+// --- v4.1 migrations: group/channel edit, invites, avatar -------------------
+  await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn('groups', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
+  await ensureColumn('channels', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
+  await ensureColumn('channels', 'verified', 'INTEGER NOT NULL DEFAULT 0'); // 1 = blue checkmark (Chatly Tech only)
+  // Seed: only the official "Chatly Tech" channel (id 5) is verified.
+  try {
+    const ct = await dbGet("SELECT id FROM channels WHERE id = 5 AND LOWER(name) LIKE '%chatly tech%'");
+    if (ct) await dbRun('UPDATE channels SET verified = 1 WHERE id = 5');
+  } catch (e) { /* best effort */ }
+  await db.execute(`
+  CREATE TABLE IF NOT EXISTS channel_invites (
+    code TEXT PRIMARY KEY,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+  );`);
+
 // --- v3.0: groups ----------------------------------------------------------
   await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS groups (
@@ -757,9 +776,14 @@ async function groupMemberRows(groupId) {
 async function groupSummary(groupId) {
   const g = (await dbGet('SELECT * FROM groups WHERE id = ?', [groupId]));
   if (!g) return null;
+  const creator = await getUserById(g.creator_id);
   return {
     groupId: g.id,
     name: g.name,
+    description: g.description || '',
+    avatar: g.avatar || null,
+    creator: creator ? creator.username : null,
+    creatorId: g.creator_id,
     members: (await groupMemberRows(groupId)).map((r) => r.username),
     createdAt: Math.floor(g.created_at / 1000),
   };
@@ -834,7 +858,7 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '4.0.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '4.1.0' })));
 
 // Public download page (no login needed): Android APK + iPhone web-app guide.
 app.get('/download', (req, res) => res.sendFile(path.join(process.cwd(), 'public', 'download.html')));
@@ -1584,6 +1608,49 @@ app.post('/api/groups/:id/remove', ah(async (req, res) => {
   res.json(await groupSummary(gid));
 }));
 
+// POST /api/groups/:id/edit {name?, description?, avatar?} — creator only.
+app.post('/api/groups/:id/edit', rateLimit('group-edit', 20), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const gid = Number(req.params.id);
+  const g = await dbGet('SELECT * FROM groups WHERE id = ?', [gid]);
+  if (!g) return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+  if (g.creator_id !== user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the group creator can edit it.' });
+  }
+  const name = String((req.body && req.body.name) || '').trim().slice(0, 80);
+  const description = String((req.body && req.body.description) || '').slice(0, 500);
+  let avatar = g.avatar;
+  if (req.body && req.body.avatar !== undefined) {
+    avatar = typeof req.body.avatar === 'string' && req.body.avatar ? req.body.avatar.slice(0, 700000) : null;
+    if (avatar && base64ByteLength(avatar) > 500 * 1024) {
+      return res.status(413).json({ error: 'too_large', message: 'Avatar must be 500KB or less.' });
+    }
+  }
+  await dbRun('UPDATE groups SET name = ?, description = ?, avatar = ? WHERE id = ?',
+    [name || g.name, description, avatar, gid]);
+  res.json({ ok: true, group: await groupSummary(gid) });
+}));
+
+// POST /api/groups/:id/leave — creator CANNOT leave (must delete the group instead).
+app.post('/api/groups/:id/leave', rateLimit('group-leave', 20), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const gid = Number(req.params.id);
+  const g = await dbGet('SELECT * FROM groups WHERE id = ?', [gid]);
+  if (!g || !await isMember(gid, user.id)) {
+    return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+  }
+  if (g.creator_id === user.id) {
+    return res.status(403).json({
+      error: 'creator_cannot_leave',
+      message: 'The creator cannot leave. Delete the group instead.',
+    });
+  }
+  await dbRun('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [gid, user.id]);
+  res.json({ ok: true });
+}));
+
 // POST /api/groups/:id/invite — generate an invite link code (any member can invite).
 app.post('/api/groups/:id/invite', rateLimit('group-invite', 20), ah(async (req, res) => {
   const user = await getApiUser(req);
@@ -1592,7 +1659,7 @@ app.post('/api/groups/:id/invite', rateLimit('group-invite', 20), ah(async (req,
   if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
-  const code = require('crypto').randomBytes(8).toString('hex');
+  const code = randomBytes(8).toString('hex');
   await dbRun('INSERT INTO group_invites (code, group_id, creator_id, created_at) VALUES (?, ?, ?, ?)',
     [code, gid, user.id, Date.now()]);
   const g = await groupSummary(gid);
@@ -1631,6 +1698,63 @@ app.post('/api/change-username', rateLimit('change-username', 10), ah(async (req
   }
   await dbRun('UPDATE users SET username = ? WHERE id = ?', [name, user.id]);
   res.json({ ok: true, username: name });
+}));
+
+// POST /api/message/react {messageId, emoji, scope} — toggle an emoji reaction.
+// scope: 'dm' | 'group'. Persists in the reactions JSON column and notifies via WS.
+app.post('/api/message/react', rateLimit('react', 60), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const msgId = Number(req.body && req.body.messageId);
+  const emoji = String((req.body && req.body.emoji) || '').trim();
+  const scope = (req.body && req.body.scope) === 'group' ? 'group' : 'dm';
+  if (!Number.isInteger(msgId) || msgId <= 0 || !emoji || [...emoji].length > 8) {
+    return res.status(400).json({ error: 'bad_request', message: 'messageId and emoji required.' });
+  }
+  const table = scope === 'group' ? 'group_messages' : 'messages';
+  const m = await dbGet(`SELECT * FROM ${table} WHERE id = ?`, [msgId]);
+  if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+  if (scope === 'dm') {
+    if (m.sender_id !== user.id && m.recipient_id !== user.id) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
+    }
+  } else {
+    if (!await isMember(m.group_id, user.id)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+  }
+  const reactions = parseReactions(m.reactions);
+  const list = Array.isArray(reactions[emoji]) ? reactions[emoji] : [];
+  let added;
+  if (list.includes(user.username)) {
+    reactions[emoji] = list.filter((x) => x !== user.username);
+    if (!reactions[emoji].length) delete reactions[emoji];
+    added = false;
+  } else {
+    reactions[emoji] = [...list, user.username];
+    added = true;
+  }
+  await dbRun(`UPDATE ${table} SET reactions = ? WHERE id = ?`, [JSON.stringify(reactions), msgId]);
+  // Notify the other party/parties via WS.
+  const payload = {
+    type: 'message-reaction',
+    messageId: msgId,
+    scope,
+    emoji,
+    from: user.username,
+    added,
+    reactions,
+  };
+  if (scope === 'dm') {
+    const otherId = m.sender_id === user.id ? m.recipient_id : m.sender_id;
+    await deliverTo(otherId, user.id, payload);
+  } else {
+    const members = await dbAll('SELECT user_id FROM group_members WHERE group_id = ?', [m.group_id]);
+    for (const r of members) {
+      if (r.user_id !== user.id) await deliverTo(r.user_id, user.id, payload);
+    }
+  }
+  res.json({ ok: true, added, reactions });
 }));
 
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,
@@ -1693,7 +1817,7 @@ async function toClientStatus(s) {
     name: u ? u.display_name || u.username : null,
     avatar: u ? u.avatar || null : null,
     kind: s.kind,
-    text: s.text || null,
+    text: s.text || '', // v6.3: never null — client hides empty captions
     data: s.data || null,
     bg: s.bg || null,
     ts: s.created_at,
@@ -1715,7 +1839,7 @@ app.post('/api/status', requireApiUser, ah(async (req, res) => {
     }
     payload = b64;
   }
-  const body = typeof text === 'string' ? text.slice(0, 500) : null;
+  const body = typeof text === 'string' ? text.slice(0, 500) : '';
   if (k === 'text' && (!body || !body.trim())) {
     return res.status(400).json({ error: 'bad_request', message: 'Text status needs text.' });
   }
@@ -1778,6 +1902,8 @@ async function channelSummary(id, forUserId) {
     id: c.id, // alias — some clients read "id"
     name: c.name,
     description: c.description || '',
+    avatar: c.avatar || null,
+    verified: c.verified === 1, // blue checkmark — only Chatly Tech for now
     subscribers: subs,
     creator: creator ? creator.username : null,
     createdAt: Math.floor(c.created_at / 1000),
@@ -1809,11 +1935,22 @@ app.post('/api/channels/create', requireApiUser, ah(async (req, res) => {
   res.json({ ok: true, channelId: s.channelId, name: s.name });
 }));
 
-// GET /api/channels?token= — public directory with subscriber counts. When a
+// GET /api/channels?token=&q= — public directory with subscriber counts. When a
 // token is supplied, each row also carries `mine` + `subscribed` for that user.
+// ?q= searches name and description (case-insensitive).
 app.get('/api/channels', ah(async (req, res) => {
   const user = await getApiUser(req);
-  const rows = (await dbAll('SELECT id FROM channels ORDER BY id DESC LIMIT 200'));
+  const q = String(req.query.q || '').trim().toLowerCase().slice(0, 50);
+  let rows;
+  if (q) {
+    const like = `%${q.replace(/[%_]/g, '')}%`;
+    rows = (await dbAll(
+      'SELECT id FROM channels WHERE LOWER(name) LIKE ? OR LOWER(description) LIKE ? ORDER BY id DESC LIMIT 200',
+      [like, like]
+    ));
+  } else {
+    rows = (await dbAll('SELECT id FROM channels ORDER BY id DESC LIMIT 200'));
+  }
   const chs = await Promise.all(rows.map(async (r) => await channelSummary(r.id, user ? user.id : undefined)));
   res.json({ channels: chs.filter(Boolean) });
 }));
@@ -1822,8 +1959,15 @@ async function channelSubHandler(req, res, subscribe) {
   const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const id = Number(req.params.id);
-  if (!await channelSummary(id)) {
+  const c = await dbGet('SELECT * FROM channels WHERE id = ?', [id]);
+  if (!c) {
     return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  }
+  if (!subscribe && c.creator_id === user.id) {
+    return res.status(403).json({
+      error: 'creator_cannot_leave',
+      message: 'The creator cannot unfollow. Delete the channel instead.',
+    });
   }
   if (subscribe) {
     (await dbRun('INSERT OR IGNORE INTO channel_subs (channel_id, user_id) VALUES (?, ?)', [id, user.id]));
@@ -1901,6 +2045,99 @@ app.delete('/api/channels/:id', requireApiUser, ah(async (req, res) => {
   (await dbRun('DELETE FROM channel_subs WHERE channel_id = ?', [id]));
   (await dbRun('DELETE FROM channels WHERE id = ?', [id]));
   res.json({ ok: true });
+}));
+
+// POST /api/channels/:id/edit {name?, description?, avatar?} — creator only.
+app.post('/api/channels/:id/edit', requireApiUser, rateLimit('channel-edit', 20), ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const c = (await dbGet('SELECT * FROM channels WHERE id = ?', [id]));
+  if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  if (c.creator_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can edit it.' });
+  }
+  const name = String((req.body && req.body.name) || '').trim().slice(0, 80);
+  const description = String((req.body && req.body.description) || '').slice(0, 500);
+  let avatar = c.avatar;
+  if (req.body && req.body.avatar !== undefined) {
+    avatar = typeof req.body.avatar === 'string' && req.body.avatar ? req.body.avatar.slice(0, 700000) : null;
+    if (avatar && base64ByteLength(avatar) > 500 * 1024) {
+      return res.status(413).json({ error: 'too_large', message: 'Avatar must be 500KB or less.' });
+    }
+  }
+  await dbRun('UPDATE channels SET name = ?, description = ?, avatar = ? WHERE id = ?',
+    [name || c.name, description, avatar, id]);
+  res.json({ ok: true, channel: await channelSummary(id, req.user.id) });
+}));
+
+// POST /api/channels/:id/invite — generate an invite link code (creator only).
+app.post('/api/channels/:id/invite', requireApiUser, rateLimit('channel-invite', 20), ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const c = (await dbGet('SELECT * FROM channels WHERE id = ?', [id]));
+  if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  if (c.creator_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can invite.' });
+  }
+  const code = randomBytes(8).toString('hex');
+  await dbRun('INSERT INTO channel_invites (code, channel_id, creator_id, created_at) VALUES (?, ?, ?, ?)',
+    [code, id, req.user.id, Date.now()]);
+  res.json({
+    ok: true,
+    code,
+    link: 'https://chatly-4vsww.faable.link/join-channel/' + id + '?code=' + code,
+    channelName: c.name,
+  });
+}));
+
+// POST /api/channels/join {code} — subscribe to a channel via invite code.
+app.post('/api/channels/join', requireApiUser, rateLimit('channel-join', 20), ah(async (req, res) => {
+  const code = String((req.body && req.body.code) || '').trim();
+  if (!code) return res.status(400).json({ error: 'bad_request', message: 'Invite code required.' });
+  const inv = await dbGet('SELECT * FROM channel_invites WHERE code = ?', [code]);
+  if (!inv) return res.status(404).json({ error: 'invalid_code', message: 'This invite link is invalid.' });
+  const c = await channelSummary(inv.channel_id, req.user.id);
+  if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  await dbRun('INSERT OR IGNORE INTO channel_subs (channel_id, user_id) VALUES (?, ?)',
+    [inv.channel_id, req.user.id]);
+  await dbRun('UPDATE channel_invites SET uses = uses + 1 WHERE code = ?', [code]);
+  res.json({ ok: true, channel: await channelSummary(inv.channel_id, req.user.id) });
+}));
+
+// GET /api/channels/:id/subscribers — list of subscribed users (creator only sees full list).
+app.get('/api/channels/:id/subscribers', requireApiUser, ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const c = await dbGet('SELECT * FROM channels WHERE id = ?', [id]);
+  if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  const rows = await dbAll(
+    `SELECT u.id, u.username, u.avatar FROM channel_subs cs
+     JOIN users u ON u.id = cs.user_id WHERE cs.channel_id = ? ORDER BY u.username`,
+    [id]
+  );
+  res.json({
+    ok: true,
+    channelId: id,
+    isCreator: c.creator_id === req.user.id,
+    subscribers: rows.map((r) => ({ id: r.id, username: r.username, avatar: r.avatar || null })),
+  });
+}));
+
+// POST /api/channels/:id/remove {username} — creator removes a subscriber.
+app.post('/api/channels/:id/remove', requireApiUser, rateLimit('channel-remove', 20), ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const c = await dbGet('SELECT * FROM channels WHERE id = ?', [id]);
+  if (!c) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  if (c.creator_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can remove subscribers.' });
+  }
+  const target = await getUserByUsername(req.body && req.body.username);
+  if (!target) return res.status(404).json({ error: 'not_found', message: 'No such user.' });
+  if (target.id === c.creator_id) {
+    return res.status(400).json({ error: 'bad_request', message: 'Cannot remove the creator.' });
+  }
+  await dbRun('DELETE FROM channel_subs WHERE channel_id = ? AND user_id = ?', [id, target.id]);
+  res.json({
+    ok: true,
+    subscribers: (await dbGet('SELECT COUNT(*) AS n FROM channel_subs WHERE channel_id = ?', [id])).n,
+  });
 }));
 
 // --- discover -------------------------------------------------------------------
@@ -2514,12 +2751,44 @@ wss.on('connection', async (ws, req) => {
     }
 
     // ---- reactions ----------------------------------------------------------
-    // {type:"reaction", to, from, msgId, emoji} → persist + relay.
+    // {type:"reaction", to, from, msgId, emoji} → persist + relay (DMs).
+    // {type:"reaction", groupId, msgId, emoji} → persist + relay (groups).
     if (msg.type === 'reaction') {
-      const partner = await resolveRecipient(msg.to);
-      const msgId = Number(msg.msgId);
       const emoji = String(msg.emoji || '').trim();
-      if (!partner || !Number.isInteger(msgId) || !emoji || [...emoji].length > 8) return;
+      const msgId = Number(msg.msgId);
+      if (!Number.isInteger(msgId) || !emoji || [...emoji].length > 8) return;
+      const gid = Number(msg.groupId || 0);
+      if (gid > 0) {
+        // Group reaction.
+        if (!await isMember(gid, userId)) return;
+        const m = (await dbGet('SELECT * FROM group_messages WHERE id = ? AND group_id = ?', [msgId, gid]));
+        if (!m) return;
+        const reactions = parseReactions(m.reactions);
+        const list = Array.isArray(reactions[emoji]) ? reactions[emoji] : [];
+        if (list.includes(user.username)) {
+          reactions[emoji] = list.filter((x) => x !== user.username);
+          if (!reactions[emoji].length) delete reactions[emoji];
+        } else {
+          reactions[emoji] = [...list, user.username];
+        }
+        (await dbRun('UPDATE group_messages SET reactions = ? WHERE id = ?', [JSON.stringify(reactions), msgId]));
+        const members = await dbAll('SELECT user_id FROM group_members WHERE group_id = ?', [gid]);
+        for (const r of members) {
+          if (r.user_id !== userId) {
+            await deliverTo(r.user_id, userId, {
+              type: 'message-reaction',
+              messageId: msgId,
+              scope: 'group',
+              emoji,
+              from: user.username,
+              reactions,
+            });
+          }
+        }
+        return;
+      }
+      const partner = await resolveRecipient(msg.to);
+      if (!partner) return;
       const m = (await dbGet('SELECT * FROM messages WHERE id = ?', [msgId]));
       if (!m) return;
       if (m.sender_id !== userId && m.recipient_id !== userId) return; // not our chat
