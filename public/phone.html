@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chatly — Phone sign-in</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0d1b2a 0%, #1b2a4a 50%, #2d1b4e 100%);
+    color: #fff; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    background: rgba(255,255,255,0.08); backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 20px;
+    padding: 32px 28px; width: 100%; max-width: 380px; text-align: center;
+  }
+  h1 { font-size: 22px; margin-bottom: 8px; }
+  p.sub { color: rgba(255,255,255,0.65); font-size: 14px; margin-bottom: 24px; }
+  input {
+    width: 100%; padding: 14px 16px; border-radius: 12px; font-size: 17px;
+    border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.08);
+    color: #fff; margin-bottom: 12px; outline: none;
+  }
+  input:focus { border-color: #2dd4bf; }
+  input::placeholder { color: rgba(255,255,255,0.4); }
+  button {
+    width: 100%; padding: 15px; border: none; border-radius: 12px; font-size: 16px;
+    font-weight: 700; color: #fff; cursor: pointer; margin-top: 4px;
+    background: linear-gradient(135deg, #14b8a6, #8b5cf6);
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .err { color: #fda4af; font-size: 13px; margin-top: 12px; min-height: 18px; }
+  .ok { color: #6ee7b7; font-size: 13px; margin-top: 12px; }
+  .step { display: none; }
+  .step.active { display: block; }
+  #recaptcha-container { margin: 12px auto; display: inline-block; }
+  .hint { color: rgba(255,255,255,0.45); font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📱 Phone sign-in</h1>
+  <p class="sub">Enter your phone number to receive a verification code by SMS.</p>
+
+  <div id="step1" class="step active">
+    <input id="phone" type="tel" placeholder="+234 801 234 5678" autocomplete="tel">
+    <div id="recaptcha-container"></div>
+    <button id="sendBtn" onclick="sendCode()">Send code</button>
+  </div>
+
+  <div id="step2" class="step">
+    <p class="sub">Enter the 6-digit code sent to <span id="phoneEcho"></span></p>
+    <input id="code" type="text" inputmode="numeric" maxlength="6" placeholder="123456">
+    <button id="verifyBtn" onclick="verifyCode()">Verify</button>
+    <p class="hint"><a href="#" onclick="goBack();return false;" style="color:#2dd4bf;">← Change number</a></p>
+  </div>
+
+  <div id="err" class="err"></div>
+  <div id="okmsg" class="ok"></div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<script>
+  firebase.initializeApp({
+    apiKey: "AIzaSyCpnN_zzE2Ih5lzEHAH_r8XsIW0BQyzzE4",
+    authDomain: "chatly-225f0.firebaseapp.com",
+    projectId: "chatly-225f0",
+    appId: "1:256512039050:android:d93f688aaaeaf75594f573"
+  });
+  var confirmationResult = null;
+  var recaptchaVerifier = new firebase.auth.RecaptchaVerifier('recaptcha-container', { size: 'normal' });
+
+  function showErr(m) { document.getElementById('err').textContent = m; document.getElementById('okmsg').textContent = ''; }
+  function showOk(m) { document.getElementById('okmsg').textContent = m; document.getElementById('err').textContent = ''; }
+  function goBack() {
+    document.getElementById('step2').classList.remove('active');
+    document.getElementById('step1').classList.add('active');
+    showErr('');
+  }
+
+  function sendCode() {
+    var phone = document.getElementById('phone').value.trim();
+    if (!phone || phone.replace(/\D/g,'').length < 7) { showErr('Enter a valid phone number with country code.'); return; }
+    showErr(''); showOk('Sending…');
+    document.getElementById('sendBtn').disabled = true;
+    firebase.auth().signInWithPhoneNumber(phone, recaptchaVerifier)
+      .then(function(cr) {
+        confirmationResult = cr;
+        document.getElementById('phoneEcho').textContent = phone;
+        document.getElementById('step1').classList.remove('active');
+        document.getElementById('step2').classList.add('active');
+        showOk('Code sent!');
+        document.getElementById('sendBtn').disabled = false;
+      })
+      .catch(function(e) {
+        document.getElementById('sendBtn').disabled = false;
+        recaptchaVerifier.render().then(function(){ recaptchaVerifier.reset(); });
+        showErr(friendly(e));
+      });
+  }
+
+  function verifyCode() {
+    var code = document.getElementById('code').value.trim();
+    if (code.length < 4) { showErr('Enter the code from the SMS.'); return; }
+    showErr(''); showOk('Verifying…');
+    document.getElementById('verifyBtn').disabled = true;
+    confirmationResult.confirm(code).then(function(result) {
+      return result.user.getIdToken();
+    }).then(function(idToken) {
+      showOk('Verified! Returning to Chatly…');
+      // Hand the Firebase ID token back to the Android app via deep link.
+      window.location = 'com.muse.chatly://phoneauth?token=' + encodeURIComponent(idToken);
+    }).catch(function(e) {
+      document.getElementById('verifyBtn').disabled = false;
+      showErr(friendly(e));
+    });
+  }
+
+  function friendly(e) {
+    var c = (e && e.code) || '';
+    if (c.indexOf('invalid-phone-number') >= 0) return 'That phone number looks invalid.';
+    if (c.indexOf('too-many-requests') >= 0) return 'Too many attempts — try again later.';
+    if (c.indexOf('invalid-verification-code') >= 0) return 'Wrong code — check the SMS and try again.';
+    if (c.indexOf('code-expired') >= 0) return 'Code expired — send a new one.';
+    if (c.indexOf('captcha') >= 0) return 'Verification check failed — try again.';
+    return (e && e.message) || 'Something went wrong. Try again.';
+  }
+</script>
+</body>
+</html>
