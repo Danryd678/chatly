@@ -186,6 +186,18 @@ async function initDb() {
     expiry INTEGER NOT NULL
   );`);
 
+// --- v3.9 migrations: message delete (for everyone / for me) -----------------
+  await ensureColumn('messages', 'deleted', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('group_messages', 'deleted', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('channel_posts', 'deleted', 'INTEGER NOT NULL DEFAULT 0');
+  await db.execute(`
+  CREATE TABLE IF NOT EXISTS deleted_messages (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    scope TEXT NOT NULL, -- 'dm' | 'group' | 'channel'
+    PRIMARY KEY (user_id, message_id, scope)
+  );`);
+
 // --- v3.0: groups ----------------------------------------------------------
   await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS groups (
@@ -814,7 +826,7 @@ const ah = (fn) => async (req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.8.0' })));
+app.get('/api/health', ah(async (req, res) => res.json({ ok: true, app: 'Chatly', version: '3.9.0' })));
 
 // Public download page (no login needed): Android APK + iPhone web-app guide.
 app.get('/download', (req, res) => res.sendFile(path.join(process.cwd(), 'public', 'download.html')));
@@ -1576,23 +1588,24 @@ app.get('/api/groups/:id/history', ah(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
   const after = Number(req.query.after || 0);
   const now = Date.now();
+  const grpNotDeleted = `AND gm.deleted = 0 AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = gm.id AND dm.scope = 'group')`;
   let rows;
   if (after > 0) {
     // v3.6: incremental poll for messages newer than `after` (fallback when WS drops).
     rows = await dbAll(
       `SELECT gm.*, u.username AS sender_username FROM group_messages gm
        JOIN users u ON u.id = gm.sender_id
-       WHERE gm.group_id = ? AND gm.id > ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
+       WHERE gm.group_id = ? AND gm.id > ? AND (gm.expire_at IS NULL OR gm.expire_at > ?) ${grpNotDeleted}
        ORDER BY gm.id ASC LIMIT ?`,
-      [gid, after, now, limit]
+      [gid, after, now, user.id, limit]
     );
   } else {
     rows = await dbAll(
       `SELECT gm.*, u.username AS sender_username FROM group_messages gm
        JOIN users u ON u.id = gm.sender_id
-       WHERE gm.group_id = ? AND (gm.expire_at IS NULL OR gm.expire_at > ?)
+       WHERE gm.group_id = ? AND (gm.expire_at IS NULL OR gm.expire_at > ?) ${grpNotDeleted}
        ORDER BY gm.id DESC LIMIT ?`,
-      [gid, now, limit]
+      [gid, now, user.id, limit]
     );
     rows.reverse();
   }
@@ -1802,7 +1815,7 @@ app.get('/api/channels/:id/posts', ah(async (req, res) => {
     return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
   }
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 100);
-  const rows = await dbAll('SELECT * FROM channel_posts WHERE channel_id = ? ORDER BY id DESC LIMIT ?', [
+  const rows = await dbAll('SELECT * FROM channel_posts WHERE channel_id = ? AND deleted = 0 ORDER BY id DESC LIMIT ?', [
     id,
     limit,
   ]);
@@ -1886,24 +1899,27 @@ app.get('/api/users', requireAuth, ah(async (req, res) => {
 async function conversationList(userId) {
   const now = Date.now();
   const live = '(expire_at IS NULL OR expire_at > ?)';
+  const notDel = `AND m.deleted = 0 AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = m.id AND dm.scope = 'dm')`;
   // One row per conversation partner, with last message + unread count.
   const rows = await dbAll(
     `SELECT
        CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS partner_id,
        MAX(m.id) AS last_id
      FROM messages m
-     WHERE (m.sender_id = ? OR m.recipient_id = ?) AND ${live}
+     WHERE (m.sender_id = ? OR m.recipient_id = ?) AND ${live} ${notDel}
      GROUP BY partner_id
      ORDER BY last_id DESC
      LIMIT 100`,
-    [userId, userId, userId, now]
+    [userId, userId, userId, now, userId]
   );
   const unread = new Map(
     (
       await dbAll(
         `SELECT sender_id, COUNT(*) AS c FROM messages
-         WHERE recipient_id = ? AND status < 2 AND ${live} GROUP BY sender_id`,
-        [userId, now]
+         WHERE recipient_id = ? AND status < 2 AND ${live} AND deleted = 0
+         AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = messages.id AND dm.scope = 'dm')
+         GROUP BY sender_id`,
+        [userId, now, userId]
       )
     ).map((r) => [r.sender_id, r.c])
   );
@@ -1936,7 +1952,8 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
     return res.status(404).json({ error: 'not_found', message: 'Chat not found.' });
   }
   let rows;
-  const convo = `((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) AND ${live}`;
+  const notDeleted = `AND deleted = 0 AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = messages.id AND dm.scope = 'dm')`;
+  const convo = `((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) AND ${live} ${notDeleted}`;
   if (after > 0) {
     // v3.6: incremental poll for messages newer than `after` (fallback when WS drops).
     rows = await dbAll(`SELECT * FROM messages WHERE ${convo} AND id > ? ORDER BY id ASC LIMIT ?`, [
@@ -1945,6 +1962,7 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
       partnerId,
       req.user.id,
       now,
+      req.user.id,
       after,
       limit,
     ]);
@@ -1955,6 +1973,7 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
       partnerId,
       req.user.id,
       now,
+      req.user.id,
       before,
       limit,
     ]);
@@ -1965,6 +1984,7 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
       partnerId,
       req.user.id,
       now,
+      req.user.id,
       limit,
     ]);
   }
@@ -2033,6 +2053,125 @@ app.post('/api/message-viewed', requireApiUser, ah(async (req, res) => {
     await deliverTo(m.sender_id, req.user.id, { type: 'view_once_viewed', id, scope: 'dm' });
   }
   return res.json({ ok: true });
+}));
+
+// POST /api/message/delete {messageId, scope:'dm'|'group'|'channel', forEveryone:bool}
+// Delete a message. forEveryone=true: only the sender, soft-deletes for all parties
+// (shows "This message was deleted") and notifies via WS. forEveryone=false: hides
+// only for the requesting user.
+app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
+  const messageId = Number(req.body && req.body.messageId);
+  const scope = req.body && req.body.scope;
+  const forEveryone = !!(req.body && req.body.forEveryone);
+  if (!Number.isInteger(messageId) || messageId <= 0) {
+    return res.status(422).json({ error: 'bad_request', message: 'Message id is required.' });
+  }
+  if (scope !== 'dm' && scope !== 'group' && scope !== 'channel') {
+    return res.status(422).json({ error: 'bad_request', message: 'Scope must be dm, group, or channel.' });
+  }
+  const userId = req.user.id;
+
+  if (scope === 'dm') {
+    const m = await dbGet('SELECT * FROM messages WHERE id = ?', [messageId]);
+    if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+    if (m.sender_id !== userId && m.recipient_id !== userId) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
+    }
+    if (forEveryone) {
+      if (m.sender_id !== userId) {
+        return res.status(403).json({ error: 'forbidden', message: 'Only the sender can delete for everyone.' });
+      }
+      await dbRun('UPDATE messages SET deleted = 1 WHERE id = ?', [messageId]);
+      const otherId = m.sender_id === userId ? m.recipient_id : m.sender_id;
+      await deliverTo(otherId, userId, { type: 'message-deleted', messageId, scope: 'dm' });
+    } else {
+      await dbRun('INSERT OR IGNORE INTO deleted_messages (user_id, message_id, scope) VALUES (?, ?, ?)',
+        [userId, messageId, 'dm']);
+    }
+    return res.json({ ok: true });
+  }
+
+  if (scope === 'group') {
+    const m = await dbGet('SELECT * FROM group_messages WHERE id = ?', [messageId]);
+    if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+    if (!(await isMember(m.group_id, userId))) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+    if (forEveryone) {
+      if (m.sender_id !== userId) {
+        return res.status(403).json({ error: 'forbidden', message: 'Only the sender can delete for everyone.' });
+      }
+      await dbRun('UPDATE group_messages SET deleted = 1 WHERE id = ?', [messageId]);
+      // Notify all other group members
+      const members = await dbAll('SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?',
+        [m.group_id, userId]);
+      for (const mem of members) {
+        await deliverTo(mem.user_id, userId, { type: 'message-deleted', messageId, scope: 'group', groupId: m.group_id });
+      }
+    } else {
+      await dbRun('INSERT OR IGNORE INTO deleted_messages (user_id, message_id, scope) VALUES (?, ?, ?)',
+        [userId, messageId, 'group']);
+    }
+    return res.json({ ok: true });
+  }
+
+  // scope === 'channel'
+  const m = await dbGet('SELECT * FROM channel_posts WHERE id = ?', [messageId]);
+  if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+  // Only the channel author or the post author can delete
+  const ch = await dbGet('SELECT * FROM channels WHERE id = ?', [m.channel_id]);
+  if (!ch) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
+  const isAuthor = ch.author_id === userId;
+  if (forEveryone) {
+    if (m.sender_id !== userId && !isAuthor) {
+      return res.status(403).json({ error: 'forbidden', message: 'Only the author can delete for everyone.' });
+    }
+    await dbRun('UPDATE channel_posts SET deleted = 1 WHERE id = ?', [messageId]);
+    const subs = await dbAll('SELECT user_id FROM channel_subs WHERE channel_id = ? AND user_id != ?',
+      [m.channel_id, userId]);
+    for (const s of subs) {
+      await deliverTo(s.user_id, userId, { type: 'message-deleted', messageId, scope: 'channel', channelId: m.channel_id });
+    }
+  } else {
+    await dbRun('INSERT OR IGNORE INTO deleted_messages (user_id, message_id, scope) VALUES (?, ?, ?)',
+      [userId, messageId, 'channel']);
+  }
+  return res.json({ ok: true });
+}));
+
+// POST /api/chat/delete {scope:'dm'|'group', partnerId?, groupId?} — delete an entire
+// chat for the requesting user (marks all messages as deleted-for-me). v3.9
+app.post('/api/chat/delete', requireApiUser, ah(async (req, res) => {
+  const scope = req.body && req.body.scope;
+  const userId = req.user.id;
+  if (scope === 'dm') {
+    const partnerId = Number(req.body && req.body.partnerId);
+    if (!Number.isInteger(partnerId) || partnerId <= 0 || partnerId === userId) {
+      return res.status(422).json({ error: 'bad_request', message: 'Valid partner id is required.' });
+    }
+    await dbRun(
+      `INSERT OR IGNORE INTO deleted_messages (user_id, message_id, scope)
+       SELECT ?, id, 'dm' FROM messages
+       WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)`,
+      [userId, userId, partnerId, partnerId, userId]);
+    return res.json({ ok: true });
+  }
+  if (scope === 'group') {
+    const groupId = String(req.body && req.body.groupId || '');
+    if (!groupId) {
+      return res.status(422).json({ error: 'bad_request', message: 'Group id is required.' });
+    }
+    const gid = Number(groupId);
+    if (!await groupSummary(gid) || !await isMember(gid, userId)) {
+      return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+    }
+    await dbRun(
+      `INSERT OR IGNORE INTO deleted_messages (user_id, message_id, scope)
+       SELECT ?, id, 'group' FROM group_messages WHERE group_id = ?`,
+      [userId, gid]);
+    return res.json({ ok: true });
+  }
+  return res.status(422).json({ error: 'bad_request', message: 'Scope must be dm or group.' });
 }));
 
 // POST /api/star {token, id, scope:'dm'|'group', starred?} — star/unstar a message
