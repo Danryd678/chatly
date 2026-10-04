@@ -203,6 +203,15 @@ async function initDb() {
     PRIMARY KEY (user_id, message_id, scope)
   );`);
 
+// --- v4.2 migrations: published websites (Chatly AI "Publish & Get Link") ----
+  await db.execute(`
+  CREATE TABLE IF NOT EXISTS published_sites (
+    id TEXT PRIMARY KEY,          -- short public id, e.g. 'a3f9k2p1'
+    html TEXT NOT NULL,           -- full self-contained HTML (<= 500KB)
+    title TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+  );`);
+
 // --- v4.1 migrations: group/channel edit, invites, avatar -------------------
   await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn('groups', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
@@ -861,6 +870,13 @@ const ah = (fn) => async (req, res, next) => {
 // carry base64 JPEGs). Handler + helpers live in the "AI proxy" section below
 // (function declarations hoist, so this is safe).
 app.post('/api/ai', express.json({ limit: '3mb' }), aiRateLimit, ah(aiHandler));
+// POST /api/publish — Chatly AI "Publish & Get Link": stores a self-contained
+// HTML website and returns a public shareable URL. Public (the app has no
+// login), rate-limited per IP. HTML capped at 500KB.
+app.post('/api/publish', express.json({ limit: '600kb' }),
+  rateLimit('publish', 10), ah(publishHandler));
+// GET /sites/:id — serves a published website.
+app.get('/sites/:id', ah(siteHandler));
 // Global JSON limit sized for the largest legitimate payload (1MB media for
 // statuses/channel posts, base64-inflated); each handler enforces its own
 // tighter cap with a JSON 413. Anything beyond this → JSON 413 via the error
@@ -968,6 +984,68 @@ async function geminiAttempt(ki, key, contents) {
     throw new Error('empty');
   }
   return text;
+}
+
+// POST /api/publish — stores a Chatly AI-built website, returns a public URL.
+async function publishHandler(req, res) {
+  const html = req.body && req.body.html;
+  if (typeof html !== 'string' || !html.trim()) {
+    return res.status(400).json({ error: 'missing_html' });
+  }
+  if (html.length > 500 * 1024) {
+    return res.status(413).json({ error: 'too_large' });
+  }
+  // Basic sanity: must look like an HTML document.
+  if (!/<html[\s>]/i.test(html) && !/<!doctype html/i.test(html)) {
+    return res.status(400).json({ error: 'not_html' });
+  }
+  // Short public id: 8 chars from a URL-safe alphabet.
+  const abc = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let id = '';
+  for (let i = 0; i < 8; i++) id += abc[Math.floor(Math.random() * abc.length)];
+  // Title: first <title> tag, fallback to generic.
+  let title = '';
+  const tm = html.match(/<title[^>]*>([^<]{1,80})<\/title>/i);
+  if (tm) title = tm[1].trim();
+  const now = Date.now();
+  try {
+    await db.execute({
+      sql: 'INSERT INTO published_sites (id, html, title, created_at) VALUES (?, ?, ?, ?)',
+      args: [id, html, title, now],
+    });
+  } catch (e) {
+    // Id collision (astronomically unlikely): retry once with a fresh id.
+    let id2 = '';
+    for (let i = 0; i < 8; i++) id2 += abc[Math.floor(Math.random() * abc.length)];
+    try {
+      await db.execute({
+        sql: 'INSERT INTO published_sites (id, html, title, created_at) VALUES (?, ?, ?, ?)',
+        args: [id2, html, title, now],
+      });
+      id = id2;
+    } catch (e2) {
+      return res.status(500).json({ error: 'busy' });
+    }
+  }
+  const base = process.env.PUBLIC_BASE_URL || 'https://chatly-4vsww.faable.link';
+  return res.json({ url: base + '/sites/' + id });
+}
+
+// GET /sites/:id — serves a published website.
+async function siteHandler(req, res) {
+  const id = (req.params.id || '').toLowerCase().trim();
+  if (!/^[a-z0-9]{8}$/.test(id)) return res.status(404).send('Not found');
+  const r = await db.execute({
+    sql: 'SELECT html FROM published_sites WHERE id = ?',
+    args: [id],
+  });
+  const row = r.rows && r.rows[0];
+  if (!row) return res.status(404).send('Not found');
+  const html = row.html !== undefined ? row.html : row[0];
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  // Allow framing so the in-app preview WebView and shares work everywhere.
+  res.set('X-Frame-Options', 'ALLOWALL');
+  return res.send(html);
 }
 
 async function aiHandler(req, res) {
