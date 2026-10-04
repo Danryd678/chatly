@@ -922,7 +922,7 @@ function aiRateLimit(req, res, next) {
 async function geminiAttempt(ki, key, contents) {
   let r;
   try {
-    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 1024 } }),
