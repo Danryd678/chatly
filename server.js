@@ -75,6 +75,11 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 // 422. Juliana sets this in Faable Variables.
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || '';
 
+// Gemini proxy for the Chatly AI app: comma-separated Google AI Studio keys
+// for POST /api/ai (round-robin with failover). Juliana sets this in Faable
+// Variables. Missing → /api/ai answers {error:"no_keys"} and the app falls
+// back to its keyless backend. Keys are never logged or echoed.
+
 // NOTE (2026-10-01): mail/config problems answer HTTP 422 (not 503/502): the
 // hosting edge proxy swallows 5xx responses and substitutes its own error
 // page. Clients read the JSON `error` field, never the status code.
@@ -851,6 +856,11 @@ const app = express();
 const ah = (fn) => async (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
 };
+// POST /api/ai (Gemini proxy for the Chatly AI app) is registered BEFORE the
+// global JSON body parser so it can use its own 3mb limit (photo messages
+// carry base64 JPEGs). Handler + helpers live in the "AI proxy" section below
+// (function declarations hoist, so this is safe).
+app.post('/api/ai', express.json({ limit: '3mb' }), aiRateLimit, ah(aiHandler));
 // Global JSON limit sized for the largest legitimate payload (1MB media for
 // statuses/channel posts, base64-inflated); each handler enforces its own
 // tighter cap with a JSON 413. Anything beyond this → JSON 413 via the error
@@ -867,6 +877,144 @@ app.get('/manifest.webmanifest', (req, res) => {
   res.type('application/manifest+json');
   res.sendFile(path.join(process.cwd(), 'public', 'manifest.webmanifest'));
 });
+
+// --- AI proxy (Chatly AI app) ------------------------------------------------
+// POST /api/ai — public Gemini proxy for the Chatly AI Android app (it has
+// no user accounts, so this route is intentionally public).
+// Juliana's Google AI Studio keys live ONLY in the GOOGLE_AI_KEYS env var
+// (comma-separated; she sets it in Faable Variables). Keys are never logged,
+// never echoed in responses, and never leave the server except to Google's
+// API (sent via the x-goog-api-key header, never in a URL).
+// Contract:
+//   req: {"messages":[{"role":"user"|"assistant","content":"..."}]} (<=20 msgs)
+//        optional "image": base64 JPEG (photo understanding), ~2MB max
+//   ok:  {"reply":"..."}
+//   err: {"error":"no_keys"} — env not configured (app uses keyless backend)
+//        {"error":"busy"} — rate-limited, bad request, or all keys failed
+//        {"error":"image_too_large"} — image over ~2MB base64
+function aiKeys() {
+  return String(process.env.GOOGLE_AI_KEYS || '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter(Boolean);
+}
+let aiKeyCursor = 0;
+
+// Per-IP rate limiter for /api/ai: generous, in-memory. Answers
+// {"error":"busy"} when exceeded (the app falls back to its keyless backend).
+const aiBuckets = new Map();
+function aiRateLimit(req, res, next) {
+  const k = `ai:${req.ip}`;
+  const now = Date.now();
+  let b = aiBuckets.get(k);
+  if (!b || now - b.start > 60000) b = { start: now, count: 0 };
+  b.count += 1;
+  aiBuckets.set(k, b);
+  if (b.count > 60) return res.status(429).json({ error: 'busy' });
+  next();
+}
+
+// One Gemini generateContent attempt with the key at index ki. Resolves the
+// reply text, or throws on any failure (the caller fails over to the next
+// key). Only the key INDEX is ever logged — never the key value.
+async function geminiAttempt(ki, key, contents) {
+  let r;
+  try {
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 1024 } }),
+      signal: AbortSignal.timeout(45000),
+    });
+  } catch (e) {
+    console.warn(`[ai] key ${ki} network/timeout (${e && e.name ? e.name : 'error'})`);
+    throw new Error('network');
+  }
+  if (!r.ok) {
+    console.warn(`[ai] key ${ki} failed: http ${r.status}`);
+    throw new Error(`http_${r.status}`);
+  }
+  let data;
+  try {
+    data = await r.json();
+  } catch {
+    console.warn(`[ai] key ${ki} bad json`);
+    throw new Error('bad_json');
+  }
+  const text = data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
+    data.candidates[0].content.parts[0].text;
+  if (typeof text !== 'string' || !text) {
+    console.warn(`[ai] key ${ki} empty reply`);
+    throw new Error('empty');
+  }
+  return text;
+}
+
+async function aiHandler(req, res) {
+  const keys = aiKeys();
+  if (!keys.length) return res.json({ error: 'no_keys' });
+
+  const body = req.body || {};
+  // Validate + normalize the OpenAI-style messages. Count and length caps
+  // protect Juliana's quota from abuse.
+  const raw = body.messages;
+  if (!Array.isArray(raw) || !raw.length || raw.length > 20) {
+    return res.json({ error: 'busy' });
+  }
+  // Optional photo: base64 JPEG for photo understanding. ~2MB cap; a data:
+  // URL prefix is tolerated and stripped. Image bytes are never logged.
+  let imageB64 = null;
+  if (body.image != null && body.image !== '') {
+    if (typeof body.image !== 'string') return res.json({ error: 'busy' });
+    imageB64 = body.image.trim();
+    if (imageB64.startsWith('data:')) {
+      const ci = imageB64.indexOf(',');
+      if (ci === -1) return res.json({ error: 'busy' });
+      imageB64 = imageB64.slice(ci + 1).trim();
+    }
+    if (imageB64.length > 2 * 1024 * 1024) return res.json({ error: 'image_too_large' });
+    if (!imageB64) return res.json({ error: 'busy' });
+  }
+  const contents = [];
+  for (const m of raw) {
+    if (!m || typeof m.content !== 'string') return res.json({ error: 'busy' });
+    const text = m.content.slice(0, 4000);
+    if (!text.trim()) continue;
+    contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text }] });
+  }
+  if (!contents.length) return res.json({ error: 'busy' });
+
+  // Photo understanding: attach the image to the latest user turn so Gemini
+  // sees the text + photo together in one turn.
+  if (imageB64) {
+    const inline = { inlineData: { mimeType: 'image/jpeg', data: imageB64 } };
+    let attached = false;
+    for (let i = contents.length - 1; i >= 0; i--) {
+      if (contents[i].role === 'user') {
+        contents[i].parts.push(inline);
+        attached = true;
+        break;
+      }
+    }
+    if (!attached) contents.push({ role: 'user', parts: [inline] });
+  }
+
+  // Round-robin with failover: start at the cursor, try each key once.
+  const start = aiKeyCursor % keys.length;
+  for (let n = 0; n < keys.length; n++) {
+    const ki = (start + n) % keys.length;
+    try {
+      const reply = await geminiAttempt(ki, keys[ki], contents);
+      aiKeyCursor = (ki + 1) % keys.length;
+      return res.json({ reply });
+    } catch {
+      // fail over to the next key (failure already logged with its index)
+    }
+  }
+  console.warn(`[ai] all ${keys.length} key(s) failed`);
+  return res.json({ error: 'busy' });
+}
 
 // --- accounts -------------------------------------------------------------
 
