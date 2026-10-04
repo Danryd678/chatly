@@ -893,8 +893,10 @@ app.get('/manifest.webmanifest', (req, res) => {
 //        {"error":"busy"} — rate-limited, bad request, or all keys failed
 //        {"error":"image_too_large"} — image over ~2MB base64
 function aiKeys() {
+  // Split on commas AND any whitespace (spaces, newlines, tabs): pasting
+  // several keys from a phone often puts each on its own line.
   return String(process.env.GOOGLE_AI_KEYS || '')
-    .split(',')
+    .split(/[\s,]+/)
     .map((k) => k.trim())
     .filter(Boolean);
 }
