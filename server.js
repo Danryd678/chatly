@@ -1004,18 +1004,24 @@ async function aiHandler(req, res) {
 
   // Round-robin with failover: start at the cursor, try each key once.
   const start = aiKeyCursor % keys.length;
+  let lastCode = 0;
   for (let n = 0; n < keys.length; n++) {
     const ki = (start + n) % keys.length;
     try {
       const reply = await geminiAttempt(ki, keys[ki], contents);
       aiKeyCursor = (ki + 1) % keys.length;
       return res.json({ reply });
-    } catch {
+    } catch (e) {
       // fail over to the next key (failure already logged with its index)
+      const m = String((e && e.message) || '').match(/^http_(\d+)$/);
+      if (m) lastCode = parseInt(m[1], 10);
     }
   }
   console.warn(`[ai] all ${keys.length} key(s) failed`);
-  return res.json({ error: 'busy' });
+  // code/keys are safe diagnostics (no secret values): they tell us whether
+  // Google rejected the keys (400), the model (404), or quota ran out (429),
+  // and how many key values the server actually sees.
+  return res.json({ error: 'busy', code: lastCode || undefined, keys: keys.length });
 }
 
 // --- accounts -------------------------------------------------------------
