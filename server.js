@@ -921,11 +921,28 @@ function aiRateLimit(req, res, next) {
 // key). Only the key INDEX is ever logged — never the key value.
 async function geminiAttempt(ki, key, contents) {
   let r;
+  // System instruction: Gemini's dedicated system prompt field. This is what
+  // makes the AI wrap websites in ```html fences (the app turns those into
+  // Preview/Save cards) and use the [DRAW:] marker for image requests.
+  const systemInstruction = {
+    parts: [{ text:
+      "You are Chatly AI, an expert coding assistant inside a mobile app. " +
+      "You build complete working websites (single self-contained HTML files with inline CSS/JS) " +
+      "and write full working code in any language, explaining clearly and concisely. " +
+      "Keep answers short unless the user asks for detail. " +
+      "When asked to build a website or page, output the entire file inside one ```html code block " +
+      "and nothing else outside it except a one-line description. " +
+      "You have a built-in in-app browser: include links in your answers and the user can tap " +
+      "them to open pages right inside the app. " +
+      "When the user asks you to draw, generate, or create an image, put exactly this on its " +
+      "own line: [DRAW: vivid detailed description of the image]. You may add short text " +
+      "around it, but the marker line itself must contain only the marker." }]
+  };
   try {
     r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({ contents, generationConfig: { maxOutputTokens: 1024 } }),
+      body: JSON.stringify({ systemInstruction, contents, generationConfig: { maxOutputTokens: 1024 } }),
       signal: AbortSignal.timeout(45000),
     });
   } catch (e) {
