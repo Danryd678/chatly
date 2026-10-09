@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>LifeLoop</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  :root {
+    --bg: #0b1220; --card: rgba(255,255,255,.06); --border: rgba(255,255,255,.12);
+    --teal: #2dd4bf; --purple: #a855f7; --text: #f1f5f9; --muted: #94a3b8;
+  }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { position:sticky; top:0; z-index:10; padding:14px 16px 10px;
+    background: linear-gradient(135deg, rgba(45,212,191,.18), rgba(168,85,247,.18));
+    backdrop-filter: blur(12px); border-bottom:1px solid var(--border); }
+  header h1 { margin:0; font-size:20px; font-weight:800; letter-spacing:.3px; }
+  header h1 .grad { background:linear-gradient(90deg,var(--teal),var(--purple));
+    -webkit-background-clip:text; background-clip:text; color:transparent; }
+  header p { margin:4px 0 0; font-size:12px; color:var(--muted); }
+  #search { width:100%; margin:10px 0 2px; padding:11px 14px; border-radius:12px;
+    border:1px solid var(--border); background:var(--card); color:var(--text);
+    font-size:15px; outline:none; }
+  #search:focus { border-color:var(--teal); }
+  main { padding:12px 14px 90px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px;
+    overflow:hidden; cursor:pointer; }
+  .card img { width:100%; height:110px; object-fit:cover; display:block; background:#111c30; }
+  .card .meta { padding:8px 10px; }
+  .card .name { font-size:14px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .card .where { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .empty { text-align:center; color:var(--muted); padding:48px 20px; font-size:14px; line-height:1.6; }
+  .empty .big { font-size:44px; display:block; margin-bottom:10px; }
+  #fab { position:fixed; right:18px; bottom:22px; width:60px; height:60px; border-radius:50%;
+    border:none; font-size:30px; color:#fff; cursor:pointer;
+    background:linear-gradient(135deg,var(--teal),var(--purple));
+    box-shadow:0 6px 20px rgba(168,85,247,.45); }
+  .view { display:none; } .view.active { display:block; }
+  .field { margin:12px 0; }
+  .field label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+  .field input, .field textarea { width:100%; padding:11px 12px; border-radius:12px;
+    border:1px solid var(--border); background:var(--card); color:var(--text);
+    font-size:15px; outline:none; font-family:inherit; }
+  .field textarea { min-height:70px; resize:vertical; }
+  #preview { width:100%; max-height:220px; object-fit:cover; border-radius:14px;
+    display:none; border:1px solid var(--border); }
+  .btn { width:100%; padding:13px; border:none; border-radius:14px; font-size:16px;
+    font-weight:700; color:#fff; cursor:pointer; margin-top:8px;
+    background:linear-gradient(135deg,var(--teal),var(--purple)); }
+  .btn.ghost { background:var(--card); border:1px solid var(--border); color:var(--text); }
+  .btn.danger { background:linear-gradient(135deg,#f43f5e,#a855f7); }
+  .detail img { width:100%; max-height:300px; object-fit:cover; border-radius:16px;
+    border:1px solid var(--border); }
+  .detail h2 { margin:14px 0 4px; font-size:22px; }
+  .detail .where { color:var(--teal); font-size:15px; font-weight:600; }
+  .detail .note { margin:12px 0; font-size:15px; line-height:1.6; color:#e2e8f0;
+    background:var(--card); border:1px solid var(--border); border-radius:12px; padding:12px; }
+  .detail .date { font-size:12px; color:var(--muted); }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  #toast { position:fixed; left:50%; bottom:90px; transform:translateX(-50%);
+    background:#1e293b; color:#fff; padding:10px 18px; border-radius:24px;
+    font-size:14px; opacity:0; transition:opacity .25s; pointer-events:none;
+    border:1px solid var(--border); z-index:50; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔄 <span class="grad">LifeLoop</span></h1>
+  <p>Where did I put that? Never lose it again.</p>
+  <input id="search" type="search" placeholder="🔍 Search: certificate, charger, keys…">
+</header>
+
+<main>
+  <!-- HOME -->
+  <section id="v-home" class="view active">
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" style="display:none">
+      <span class="big">📦</span>
+      Nothing saved yet.<br>Tap <b>+</b> below, snap a photo,<br>and tell LifeLoop where you kept it.
+    </div>
+  </section>
+
+  <!-- FORM -->
+  <section id="v-form" class="view">
+    <div class="field">
+      <label>Photo</label>
+      <img id="preview" alt="">
+      <button class="btn ghost" id="btnPhoto" type="button">📷 Take / choose photo</button>
+      <input id="fileInput" type="file" accept="image/*" style="display:none">
+    </div>
+    <div class="field"><label>What is it?</label><input id="fName" placeholder="e.g. School certificate"></div>
+    <div class="field"><label>Where did you keep it?</label><input id="fWhere" placeholder="e.g. Blue box in the bedroom"></div>
+    <div class="field"><label>Note (optional)</label><textarea id="fNote" placeholder="Any extra detail…"></textarea></div>
+    <button class="btn" id="btnSave">💾 Save item</button>
+    <button class="btn ghost" id="btnCancel">Cancel</button>
+  </section>
+
+  <!-- DETAIL -->
+  <section id="v-detail" class="view">
+    <div class="detail">
+      <img id="dPhoto" alt="">
+      <h2 id="dName"></h2>
+      <div class="where" id="dWhere"></div>
+      <div class="note" id="dNote"></div>
+      <div class="date" id="dDate"></div>
+      <div class="row2">
+        <button class="btn ghost" id="btnBack">← Back</button>
+        <button class="btn ghost" id="btnEdit">✏️ Edit</button>
+      </div>
+      <button class="btn danger" id="btnDelete">🗑 Delete</button>
+    </div>
+  </section>
+</main>
+
+<button id="fab" title="Add item">＋</button>
+<div id="toast"></div>
+
+<script>
+(function(){
+  "use strict";
+  var KEY = "lifeloop_items_v1";
+  var items = [];
+  var editingId = null, viewingId = null, pendingPhoto = null;
+  try { items = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch(e){ items = []; }
+
+  function $(id){ return document.getElementById(id); }
+  function save(){ try { localStorage.setItem(KEY, JSON.stringify(items)); } catch(e){ toast("Storage full — delete an old item"); } }
+  function toast(msg){ var t=$("toast"); t.textContent=msg; t.style.opacity=1;
+    clearTimeout(t._h); t._h=setTimeout(function(){t.style.opacity=0;},2200); }
+  function show(v){ document.querySelectorAll(".view").forEach(function(x){x.classList.remove("active");});
+    $("v-"+v).classList.add("active"); window.scrollTo(0,0); }
+  function esc(s){ return String(s||"").replace(/[&<>"]/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); }
+
+  function render(){
+    var q = $("search").value.trim().toLowerCase();
+    var g = $("grid"); g.innerHTML = "";
+    var list = items.filter(function(it){
+      return !q || (it.name+" "+it.where+" "+it.note).toLowerCase().indexOf(q) >= 0;
+    }).sort(function(a,b){ return b.ts - a.ts; });
+    $("empty").style.display = items.length ? "none" : "block";
+    list.forEach(function(it){
+      var d = document.createElement("div"); d.className = "card";
+      d.innerHTML = '<img src="'+it.photo+'" alt="">'+
+        '<div class="meta"><div class="name">'+esc(it.name)+'</div>'+
+        '<div class="where">📍 '+esc(it.where)+'</div></div>';
+      d.onclick = function(){ openDetail(it.id); };
+      g.appendChild(d);
+    });
+  }
+
+  function openForm(id){
+    editingId = id || null; pendingPhoto = null;
+    $("preview").style.display = "none";
+    if (id) {
+      var it = items.find(function(x){ return x.id===id; });
+      $("fName").value = it.name; $("fWhere").value = it.where; $("fNote").value = it.note||"";
+      if (it.photo) { $("preview").src = it.photo; $("preview").style.display="block"; pendingPhoto = it.photo; }
+      $("btnSave").textContent = "💾 Save changes";
+    } else {
+      $("fName").value=""; $("fWhere").value=""; $("fNote").value="";
+      $("btnSave").textContent = "💾 Save item";
+    }
+    show("form");
+  }
+
+  function openDetail(id){
+    var it = items.find(function(x){ return x.id===id; }); if(!it) return;
+    viewingId = id;
+    $("dPhoto").src = it.photo;
+    $("dName").textContent = it.name;
+    $("dWhere").textContent = "📍 " + it.where;
+    $("dNote").style.display = it.note ? "block" : "none";
+    $("dNote").textContent = it.note || "";
+    $("dDate").textContent = "Saved " + new Date(it.ts).toLocaleString();
+    show("detail");
+  }
+
+  // Photo: compress to a small JPEG so many items fit on the phone.
+  // The file comes from the app's private camera capture — never the gallery.
+  $("btnPhoto").onclick = function(){ $("fileInput").click(); };
+  $("fileInput").onchange = function(){
+    var f = this.files && this.files[0]; if(!f) return;
+    var img = new Image();
+    img.onload = function(){
+      var max = 1024, w = img.width, h = img.height;
+      if (w > max || h > max) { var r = max/Math.max(w,h); w=Math.round(w*r); h=Math.round(h*r); }
+      var c = document.createElement("canvas"); c.width=w; c.height=h;
+      c.getContext("2d").drawImage(img,0,0,w,h);
+      pendingPhoto = c.toDataURL("image/jpeg", 0.75);
+      $("preview").src = pendingPhoto; $("preview").style.display="block";
+      URL.revokeObjectURL(img.src); toast("Photo ready ✓");
+    };
+    img.onerror = function(){ toast("Could not read that photo"); };
+    img.src = URL.createObjectURL(f);
+    this.value = "";
+  };
+
+  $("btnSave").onclick = function(){
+    var name = $("fName").value.trim(), where = $("fWhere").value.trim();
+    if (!name) { toast("Give the item a name"); return; }
+    if (!where) { toast("Say where you kept it"); return; }
+    if (!pendingPhoto && !editingId) { toast("Add a photo first"); return; }
+    var note = $("fNote").value.trim();
+    if (editingId) {
+      var it = items.find(function(x){ return x.id===editingId; });
+      it.name=name; it.where=where; it.note=note;
+      if (pendingPhoto) it.photo = pendingPhoto;
+      toast("Updated ✓");
+    } else {
+      items.push({ id:"it"+Date.now(), name:name, where:where, note:note,
+        photo:pendingPhoto, ts:Date.now() });
+      toast("Saved ✓ — LifeLoop remembers");
+    }
+    save(); render(); show("home");
+  };
+
+  $("btnCancel").onclick = function(){ show("home"); };
+  $("btnBack").onclick = function(){ show("home"); };
+  $("btnEdit").onclick = function(){ openForm(viewingId); };
+  $("btnDelete").onclick = function(){
+    if (!confirm("Delete this item?")) return;
+    items = items.filter(function(x){ return x.id!==viewingId; });
+    save(); render(); show("home"); toast("Deleted");
+  };
+  $("fab").onclick = function(){ openForm(null); };
+  $("search").oninput = render;
+
+  render();
+})();
+</script>
+</body>
+</html>
