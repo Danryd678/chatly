@@ -152,6 +152,95 @@ async function initDb() {
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 `);
 
+// --- v3.1: statuses (24h stories) -------------------------------------------
+  await db.executeMultiple(`
+  CREATE TABLE IF NOT EXISTS statuses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'text', -- text|image
+    text TEXT,
+    data TEXT, -- base64 image, <= 1MB decoded
+    bg TEXT, -- background style identifier chosen by the client
+    created_at INTEGER NOT NULL,
+    expire_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_statuses_expire ON statuses(expire_at);
+`);
+
+// --- v3.1: broadcast channels ------------------------------------------------
+  await db.executeMultiple(`
+  CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS channel_subs (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (channel_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS channel_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'text', -- text|image
+    text TEXT NOT NULL DEFAULT '',
+    data TEXT, -- base64 image, <= 1MB decoded
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_channel_posts ON channel_posts(channel_id, id);
+  -- Starred messages (v3.6): per-user bookmarks into DM or group messages.
+  CREATE TABLE IF NOT EXISTS starred_messages (
+    user_id INTEGER NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'dm', -- 'dm' | 'group'
+    message_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, scope, message_id)
+  );
+`);
+
+
+// --- v3.0: groups ----------------------------------------------------------
+  await db.executeMultiple(`
+  CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS group_invites (
+    code TEXT PRIMARY KEY,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS group_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'text',
+    body TEXT NOT NULL DEFAULT '',
+    data TEXT,
+    mime TEXT,
+    reactions TEXT NOT NULL DEFAULT '{}',
+    ttl INTEGER,
+    expire_at INTEGER,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_group_messages ON group_messages(group_id, id);
+  CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
+`);
+  // --- v3.5: view-once columns on group_messages (table now exists) -----------
+  await ensureColumn('group_messages', 'view_once', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('group_messages', 'viewed_at', 'INTEGER');
+
 // --- v3.0 migrations: email + verification on users ----------------------
   await ensureColumn('users', 'email', 'TEXT'); // UNIQUE index created below
   await ensureColumn('users', 'verified', 'INTEGER NOT NULL DEFAULT 1'); // legacy accounts grandfathered
@@ -203,15 +292,6 @@ async function initDb() {
     PRIMARY KEY (user_id, message_id, scope)
   );`);
 
-// --- v4.2 migrations: published websites (Chatly AI "Publish & Get Link") ----
-  await db.execute(`
-  CREATE TABLE IF NOT EXISTS published_sites (
-    id TEXT PRIMARY KEY,          -- short public id, e.g. 'a3f9k2p1'
-    html TEXT NOT NULL,           -- full self-contained HTML (<= 500KB)
-    title TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL
-  );`);
-
 // --- v4.1 migrations: group/channel edit, invites, avatar -------------------
   await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn('groups', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
@@ -230,46 +310,14 @@ async function initDb() {
     created_at INTEGER NOT NULL,
     uses INTEGER NOT NULL DEFAULT 0
   );`);
+  await db.execute(`
+  CREATE TABLE IF NOT EXISTS published_sites (
+    id TEXT PRIMARY KEY,          -- short public id, e.g. 'a3f9k2p1'
+    html TEXT NOT NULL,           -- full self-contained HTML (<= 500KB)
+    title TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+  );`);
 
-// --- v3.0: groups ----------------------------------------------------------
-  await db.executeMultiple(`
-  CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS group_members (
-    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    PRIMARY KEY (group_id, user_id)
-  );
-  CREATE TABLE IF NOT EXISTS group_invites (
-    code TEXT PRIMARY KEY,
-    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at INTEGER NOT NULL,
-    uses INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS group_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL DEFAULT 'text',
-    body TEXT NOT NULL DEFAULT '',
-    data TEXT,
-    mime TEXT,
-    reactions TEXT NOT NULL DEFAULT '{}',
-    ttl INTEGER,
-    expire_at INTEGER,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_group_messages ON group_messages(group_id, id);
-  CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
-`);
-  // --- v3.5: view-once columns on group_messages (table now exists) -----------
-  await ensureColumn('group_messages', 'view_once', 'INTEGER NOT NULL DEFAULT 0');
-  await ensureColumn('group_messages', 'viewed_at', 'INTEGER');
 
 // --- v3.1 migrations: pending email changes --------------------------------
   await ensureColumn('users', 'pending_email', 'TEXT'); // new address awaiting verification
@@ -280,52 +328,22 @@ async function initDb() {
   await ensureColumn('users', 'privacy', "TEXT NOT NULL DEFAULT '{}'"); // JSON: {lastSeen,photo,about} each "everyone"|"nobody"
   await ensureColumn('users', 'last_seen', 'INTEGER'); // epoch ms of last activity (WS connect/disconnect)
 
-// --- v3.1: statuses (24h stories) -------------------------------------------
+// --- v2.0 migrations: Chatly Browser accounts --------------------------------
+// Server-verified accounts for the Chatly Browser app (user@mail.chatly.app).
+// Kept in their own tables + session store so they never mix with chat auth.
   await db.executeMultiple(`
-  CREATE TABLE IF NOT EXISTS statuses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL DEFAULT 'text', -- text|image
-    text TEXT,
-    data TEXT, -- base64 image, <= 1MB decoded
-    bg TEXT, -- background style identifier chosen by the client
-    created_at INTEGER NOT NULL,
-    expire_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_statuses_expire ON statuses(expire_at);
-`);
-
-// --- v3.1: broadcast channels ------------------------------------------------
-  await db.executeMultiple(`
-  CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    creator_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  CREATE TABLE IF NOT EXISTS browser_accounts (
+    username TEXT PRIMARY KEY, -- e.g. user@mail.chatly.app (lowercase)
+    pass_hash TEXT NOT NULL,
+    dob TEXT NOT NULL, -- ISO date YYYY-MM-DD
     created_at INTEGER NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS channel_subs (
-    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    PRIMARY KEY (channel_id, user_id)
+  CREATE TABLE IF NOT EXISTS browser_sessions (
+    token TEXT PRIMARY KEY,
+    username TEXT NOT NULL REFERENCES browser_accounts(username) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS channel_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL DEFAULT 'text', -- text|image
-    text TEXT NOT NULL DEFAULT '',
-    data TEXT, -- base64 image, <= 1MB decoded
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_channel_posts ON channel_posts(channel_id, id);
-  -- Starred messages (v3.6): per-user bookmarks into DM or group messages.
-  CREATE TABLE IF NOT EXISTS starred_messages (
-    user_id INTEGER NOT NULL,
-    scope TEXT NOT NULL DEFAULT 'dm', -- 'dm' | 'group'
-    message_id INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (user_id, scope, message_id)
-  );
+  CREATE INDEX IF NOT EXISTS idx_browser_sessions_user ON browser_sessions(username);
 `);
 }
 
@@ -395,6 +413,53 @@ async function getApiUser(req) {
     token = auth.slice(7);
   }
   return token ? await apiUserFromToken(String(token)) : null;
+}
+
+// ---- Chatly Browser accounts (v2.0) ----------------------------------------
+// Own username namespace (user@mail.chatly.app), own password hashes, own
+// session store — separate from chat users/sessions on purpose.
+const BROWSER_USER_RE = /^[a-z0-9._-]+@mail\.chatly\.app$/;
+
+async function newBrowserSession(username) {
+  (await dbRun('DELETE FROM browser_sessions WHERE username = ? AND expires_at < ?', [username, Date.now()]));
+  const token = randomBytes(32).toString('hex');
+  (await dbRun('INSERT INTO browser_sessions (token, username, expires_at) VALUES (?, ?, ?)', [token, username, Date.now() + SESSION_TTL_MS]));
+  return token;
+}
+
+async function browserUserFromToken(token) {
+  if (typeof token !== 'string' || !token) return null;
+  const row = await dbGet(
+    'SELECT b.username, b.dob, s.expires_at FROM browser_sessions s JOIN browser_accounts b ON b.username = s.username WHERE s.token = ?',
+    [token]
+  );
+  if (!row) return null;
+  if (row.expires_at < Date.now()) {
+    (await dbRun('DELETE FROM browser_sessions WHERE token = ?', [token]));
+    return null;
+  }
+  return { username: row.username, dob: row.dob, sessionToken: token };
+}
+
+// Token for the Chatly Browser JSON API: body field, query string, or Bearer header.
+async function getBrowserUser(req) {
+  const b = req.body || {};
+  let token = b.token || req.query.token;
+  const auth = req.headers.authorization;
+  if (!token && typeof auth === 'string' && auth.startsWith('Bearer ')) {
+    token = auth.slice(7);
+  }
+  return token ? await browserUserFromToken(String(token)) : null;
+}
+
+// dob must be a real past calendar date in YYYY-MM-DD form.
+function isValidDob(dob) {
+  if (typeof dob !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dob)) return false;
+  const d = new Date(dob + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return false;
+  // Reject overflow dates like 2021-02-30 (which roll over into March).
+  if (d.toISOString().slice(0, 10) !== dob) return false;
+  return d.getTime() < Date.now();
 }
 
 // WebSocket handshake: cookie first (web UI), then ?token= (Android).
@@ -909,8 +974,6 @@ app.get('/manifest.webmanifest', (req, res) => {
 //        {"error":"busy"} — rate-limited, bad request, or all keys failed
 //        {"error":"image_too_large"} — image over ~2MB base64
 function aiKeys() {
-  // Split on commas AND any whitespace (spaces, newlines, tabs): pasting
-  // several keys from a phone often puts each on its own line.
   return String(process.env.GOOGLE_AI_KEYS || '')
     .split(/[\s,]+/)
     .map((k) => k.trim())
@@ -936,7 +999,6 @@ function aiRateLimit(req, res, next) {
 // reply text, or throws on any failure (the caller fails over to the next
 // key). Only the key INDEX is ever logged — never the key value.
 async function geminiAttempt(ki, key, contents) {
-  let r;
   // System instruction: Gemini's dedicated system prompt field. This is what
   // makes the AI wrap websites in ```html fences (the app turns those into
   // Preview/Save cards) and use the [DRAW:] marker for image requests.
@@ -954,7 +1016,9 @@ async function geminiAttempt(ki, key, contents) {
       "own line: [DRAW: vivid detailed description of the image]. You may add short text " +
       "around it, but the marker line itself must contain only the marker." }]
   };
+  let r;
   try {
+    // NOTE: model MUST be gemini-flash-latest — gemini-2.5-flash 404s on v1beta.
     r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -984,6 +1048,71 @@ async function geminiAttempt(ki, key, contents) {
     throw new Error('empty');
   }
   return text;
+}
+
+async function aiHandler(req, res) {
+  const keys = aiKeys();
+  if (!keys.length) return res.json({ error: 'no_keys' });
+
+  const body = req.body || {};
+  // Validate + normalize the OpenAI-style messages. Count and length caps
+  // protect Juliana's quota from abuse.
+  const raw = body.messages;
+  if (!Array.isArray(raw) || !raw.length || raw.length > 20) {
+    return res.json({ error: 'busy' });
+  }
+  // Optional photo: base64 JPEG for photo understanding. ~2MB cap; a data:
+  // URL prefix is tolerated and stripped. Image bytes are never logged.
+  let imageB64 = null;
+  if (body.image != null && body.image !== '') {
+    if (typeof body.image !== 'string') return res.json({ error: 'busy' });
+    imageB64 = body.image.trim();
+    if (imageB64.startsWith('data:')) {
+      const ci = imageB64.indexOf(',');
+      if (ci === -1) return res.json({ error: 'busy' });
+      imageB64 = imageB64.slice(ci + 1).trim();
+    }
+    if (imageB64.length > 2 * 1024 * 1024) return res.json({ error: 'image_too_large' });
+    if (!imageB64) return res.json({ error: 'busy' });
+  }
+  const contents = [];
+  for (const m of raw) {
+    if (!m || typeof m.content !== 'string') return res.json({ error: 'busy' });
+    const text = m.content.slice(0, 4000);
+    if (!text.trim()) continue;
+    contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text }] });
+  }
+  if (!contents.length) return res.json({ error: 'busy' });
+
+  // Photo understanding: attach the image to the latest user turn so Gemini
+  // sees the text + photo together in one turn.
+  if (imageB64) {
+    const inline = { inlineData: { mimeType: 'image/jpeg', data: imageB64 } };
+    let attached = false;
+    for (let i = contents.length - 1; i >= 0; i--) {
+      if (contents[i].role === 'user') {
+        contents[i].parts.push(inline);
+        attached = true;
+        break;
+      }
+    }
+    if (!attached) contents.push({ role: 'user', parts: [inline] });
+  }
+
+  // Round-robin with failover: start at the cursor, try each key once.
+  const start = aiKeyCursor % keys.length;
+  for (let n = 0; n < keys.length; n++) {
+    const ki = (start + n) % keys.length;
+    try {
+      const reply = await geminiAttempt(ki, keys[ki], contents);
+      aiKeyCursor = (ki + 1) % keys.length;
+      return res.json({ reply });
+    } catch {
+      // fail over to the next key (failure already logged with its index)
+    }
+  }
+  console.warn(`[ai] all ${keys.length} key(s) failed`);
+  return res.json({ error: 'busy' });
 }
 
 // POST /api/publish — stores a Chatly AI-built website, returns a public URL.
@@ -1046,77 +1175,6 @@ async function siteHandler(req, res) {
   // Allow framing so the in-app preview WebView and shares work everywhere.
   res.set('X-Frame-Options', 'ALLOWALL');
   return res.send(html);
-}
-
-async function aiHandler(req, res) {
-  const keys = aiKeys();
-  if (!keys.length) return res.json({ error: 'no_keys' });
-
-  const body = req.body || {};
-  // Validate + normalize the OpenAI-style messages. Count and length caps
-  // protect Juliana's quota from abuse.
-  const raw = body.messages;
-  if (!Array.isArray(raw) || !raw.length || raw.length > 20) {
-    return res.json({ error: 'busy' });
-  }
-  // Optional photo: base64 JPEG for photo understanding. ~2MB cap; a data:
-  // URL prefix is tolerated and stripped. Image bytes are never logged.
-  let imageB64 = null;
-  if (body.image != null && body.image !== '') {
-    if (typeof body.image !== 'string') return res.json({ error: 'busy' });
-    imageB64 = body.image.trim();
-    if (imageB64.startsWith('data:')) {
-      const ci = imageB64.indexOf(',');
-      if (ci === -1) return res.json({ error: 'busy' });
-      imageB64 = imageB64.slice(ci + 1).trim();
-    }
-    if (imageB64.length > 2 * 1024 * 1024) return res.json({ error: 'image_too_large' });
-    if (!imageB64) return res.json({ error: 'busy' });
-  }
-  const contents = [];
-  for (const m of raw) {
-    if (!m || typeof m.content !== 'string') return res.json({ error: 'busy' });
-    const text = m.content.slice(0, 4000);
-    if (!text.trim()) continue;
-    contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text }] });
-  }
-  if (!contents.length) return res.json({ error: 'busy' });
-
-  // Photo understanding: attach the image to the latest user turn so Gemini
-  // sees the text + photo together in one turn.
-  if (imageB64) {
-    const inline = { inlineData: { mimeType: 'image/jpeg', data: imageB64 } };
-    let attached = false;
-    for (let i = contents.length - 1; i >= 0; i--) {
-      if (contents[i].role === 'user') {
-        contents[i].parts.push(inline);
-        attached = true;
-        break;
-      }
-    }
-    if (!attached) contents.push({ role: 'user', parts: [inline] });
-  }
-
-  // Round-robin with failover: start at the cursor, try each key once.
-  const start = aiKeyCursor % keys.length;
-  let lastCode = 0;
-  for (let n = 0; n < keys.length; n++) {
-    const ki = (start + n) % keys.length;
-    try {
-      const reply = await geminiAttempt(ki, keys[ki], contents);
-      aiKeyCursor = (ki + 1) % keys.length;
-      return res.json({ reply });
-    } catch (e) {
-      // fail over to the next key (failure already logged with its index)
-      const m = String((e && e.message) || '').match(/^http_(\d+)$/);
-      if (m) lastCode = parseInt(m[1], 10);
-    }
-  }
-  console.warn(`[ai] all ${keys.length} key(s) failed`);
-  // code/keys are safe diagnostics (no secret values): they tell us whether
-  // Google rejected the keys (400), the model (404), or quota ran out (429),
-  // and how many key values the server actually sees.
-  return res.json({ error: 'busy', code: lastCode || undefined, keys: keys.length });
 }
 
 // --- accounts -------------------------------------------------------------
@@ -1270,6 +1328,71 @@ async function selfProfileHandler(req, res) {
 }
 app.get('/api/me', ah(selfProfileHandler));
 app.post('/api/me', ah(selfProfileHandler));
+
+// --- Chatly Browser accounts (v2.0) ------------------------------------------
+// Server-verified accounts for the Chatly Browser app. Separate namespace
+// from chat users: these accounts only ever identify a browser user (the
+// dob feeds the app's age gate), they never log into chat.
+
+// POST /api/browser/register {username, password, dob}
+// username looks like user@mail.chatly.app (lowercase). 201 {ok:true}.
+app.post('/api/browser/register', rateLimit('browser-register', 10), ah(async (req, res) => {
+  const { username, password, dob } = req.body || {};
+  const name = typeof username === 'string' ? username.trim().toLowerCase() : '';
+  if (!BROWSER_USER_RE.test(name)) {
+    return res.status(400).json({
+      error: 'invalid_username',
+      message: 'Username must look like you@mail.chatly.app (lowercase letters, numbers, . _ -).',
+    });
+  }
+  if (typeof password !== 'string' || password.length < 6 || password.length > 200) {
+    return res
+      .status(400)
+      .json({ error: 'weak_password', message: 'Password must be at least 6 characters.' });
+  }
+  if (!isValidDob(dob)) {
+    return res.status(400).json({
+      error: 'invalid_dob',
+      message: 'Date of birth must be a real past date in YYYY-MM-DD format.',
+    });
+  }
+  if (await dbGet('SELECT username FROM browser_accounts WHERE username = ?', [name])) {
+    return res.status(409).json({ error: 'username_taken', message: 'That username is taken.' });
+  }
+  try {
+    (await dbRun('INSERT INTO browser_accounts (username, pass_hash, dob, created_at) VALUES (?, ?, ?, ?)', [name, hashPassword(password), dob, Date.now()]));
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) {
+      return res.status(409).json({ error: 'username_taken', message: 'That username is taken.' });
+    }
+    throw e;
+  }
+  res.status(201).json({ ok: true });
+}));
+
+// POST /api/browser/login {username, password} — {token, dob} on success.
+// The app needs dob back so it can apply the age gate without another call.
+app.post('/api/browser/login', rateLimit('browser-login', 20), ah(async (req, res) => {
+  const { username, password } = req.body || {};
+  const name = typeof username === 'string' ? username.trim().toLowerCase() : '';
+  if (!name || typeof password !== 'string') {
+    return res.status(400).json({ error: 'bad_request', message: 'Username and password required.' });
+  }
+  const row = await dbGet('SELECT username, pass_hash, dob FROM browser_accounts WHERE username = ?', [name]);
+  if (!row || !verifyPassword(password, row.pass_hash)) {
+    return res.status(401).json({ error: 'bad_credentials', message: 'Wrong username or password.' });
+  }
+  const token = await newBrowserSession(row.username);
+  res.json({ ok: true, token, dob: row.dob });
+}));
+
+// GET /api/browser/me — token via body/query/Bearer, like the chat API.
+// Returns the verified account identity + dob for the age gate.
+app.get('/api/browser/me', ah(async (req, res) => {
+  const user = await getBrowserUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Invalid or expired token.' });
+  res.json({ ok: true, username: user.username, dob: user.dob });
+}));
 
 // POST /api/auth/google {idToken, username?} — Google sign-in.
 // Verifies the ID token with Google, requires aud == GOOGLE_CLIENT_ID and
