@@ -308,6 +308,25 @@ await ensureColumn('messages', 'reply_to', 'INTEGER'); // id of the quoted DM; N
 // --- v6.8 migrations: voice note duration --------------------------------------
 await ensureColumn('messages', 'duration_sec', 'INTEGER'); // voice note length in seconds; NULL = n/a
 
+// --- v7.1 migrations: group admin roles, read receipts, group message extras --
+await ensureColumn('group_members', 'role', "TEXT NOT NULL DEFAULT 'member'"); // 'admin' | 'member'
+await ensureColumn('group_members', 'joined_at', 'INTEGER'); // epoch ms; used for oldest-member admin promotion
+// Backfill: group creators are admins; joined_at falls back to the group's created_at.
+await dbRun(`UPDATE group_members SET role = 'admin' WHERE role = 'member' AND user_id IN (SELECT creator_id FROM groups WHERE groups.id = group_members.group_id)`);
+await dbRun(`UPDATE group_members SET joined_at = (SELECT created_at FROM groups WHERE groups.id = group_members.group_id) WHERE joined_at IS NULL`);
+await db.execute(`
+  CREATE TABLE IF NOT EXISTS group_reads (
+    group_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    last_read_msg INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (group_id, user_id)
+  );`);
+await ensureColumn('group_messages', 'edited', 'INTEGER NOT NULL DEFAULT 0');
+await ensureColumn('group_messages', 'edited_at', 'INTEGER');
+await ensureColumn('group_messages', 'reply_to', 'INTEGER'); // id of quoted group message; NULL = not a reply
+await ensureColumn('group_messages', 'duration_sec', 'INTEGER'); // voice note length in seconds; NULL = n/a
+await ensureColumn('group_messages', 'deleted_at', 'INTEGER'); // epoch ms of delete-for-everyone
+
 // --- v4.1 migrations: group/channel edit, invites, avatar -------------------
   await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn('groups', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
@@ -869,12 +888,20 @@ function toClientMessage(m) {
   return o;
 }
 
-async function insertGroupMessage(groupId, senderId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false }) {
+async function insertGroupMessage(groupId, senderId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false, replyTo = null, durationSec = null }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
+  // v7.1: validate the quoted message exists and belongs to this group.
+  let replyToId = null;
+  if (replyTo != null) {
+    const q = await dbGet('SELECT id FROM group_messages WHERE id = ? AND group_id = ?', [Number(replyTo), groupId]);
+    if (!q) { const e = new Error('bad_reply_to'); e.code = 'bad_reply_to'; throw e; }
+    replyToId = q.id;
+  }
+  const dur = Number.isInteger(durationSec) && durationSec >= 1 && durationSec <= 600 ? durationSec : null;
   const info = await dbRun(
-    'INSERT INTO group_messages (group_id, sender_id, kind, body, data, mime, ttl, expire_at, created_at, view_once) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [groupId, senderId, kind, body, data, mime, ttl, expireAt, now, viewOnce ? 1 : 0]
+    'INSERT INTO group_messages (group_id, sender_id, kind, body, data, mime, ttl, expire_at, created_at, view_once, reply_to, duration_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [groupId, senderId, kind, body, data, mime, ttl, expireAt, now, viewOnce ? 1 : 0, replyToId, dur]
   );
   return (await dbGet('SELECT * FROM group_messages WHERE id = ?', [info.lastInsertRowid]));
 }
@@ -897,8 +924,27 @@ function toClientGroupMessage(m, senderUsername) {
     createdAt: m.created_at,
     viewOnce,
     viewed,
+    edited: !!m.edited, // v7.1
+    editedAt: m.edited_at || null, // v7.1
+    durationSec: m.duration_sec != null ? Number(m.duration_sec) : null, // v7.1: voice note length
   };
   if (viewOnce && viewed) delete o.data; // placeholder only — the media is gone for good
+  return o;
+}
+// Async variant that also resolves the replyTo quote (v7.1).
+async function toClientGroupMessageFull(m, senderUsername) {
+  const o = toClientGroupMessage(m, senderUsername);
+  if (m.reply_to) {
+    const q = await dbGet('SELECT gm.*, u.username AS sender_username FROM group_messages gm JOIN users u ON u.id = gm.sender_id WHERE gm.id = ?', [m.reply_to]);
+    if (q) {
+      o.replyTo = {
+        messageId: q.id,
+        sender: q.sender_username,
+        snippet: q.deleted ? '🚫 This message was deleted' : (q.kind === 'audio' ? '🎤 Voice note' : String(q.body || '').slice(0, 80)),
+        deleted: !!q.deleted,
+      };
+    }
+  }
   return o;
 }
 
@@ -929,6 +975,77 @@ async function groupSummary(groupId) {
     members: (await groupMemberRows(groupId)).map((r) => r.username),
     createdAt: Math.floor(g.created_at / 1000),
   };
+}
+
+// --- v7.1: group admin roles + read receipts -----------------------------------
+// Role of a user in a group: 'admin' | 'member' | null (not a member).
+// The group creator is always an admin, even if the role column says otherwise.
+async function getMemberRole(groupId, userId) {
+  const g = await dbGet('SELECT creator_id FROM groups WHERE id = ?', [groupId]);
+  if (!g) return null;
+  if (g.creator_id === userId) return 'admin';
+  const r = await dbGet('SELECT role FROM group_members WHERE group_id = ? AND user_id = ?', [groupId, userId]);
+  return r ? r.role : null;
+}
+async function isGroupAdmin(groupId, userId) {
+  return (await getMemberRole(groupId, userId)) === 'admin';
+}
+async function groupMemberCount(groupId) {
+  return (await dbGet('SELECT COUNT(*) AS c FROM group_members WHERE group_id = ?', [groupId])).c;
+}
+// Map of username -> role for every member (for the group info screen).
+async function groupMemberRoles(groupId) {
+  const rows = await dbAll(
+    `SELECT u.username, gm.role, gm.user_id FROM group_members gm
+     JOIN users u ON u.id = gm.user_id WHERE gm.group_id = ?`,
+    [groupId]
+  );
+  const g = await dbGet('SELECT creator_id FROM groups WHERE id = ?', [groupId]);
+  const out = {};
+  for (const r of rows) out[r.username] = (g && g.creator_id === r.user_id) ? 'admin' : (r.role || 'member');
+  return out;
+}
+async function markGroupRead(groupId, userId, msgId) {
+  const cur = await dbGet('SELECT last_read_msg FROM group_reads WHERE group_id = ? AND user_id = ?', [groupId, userId]);
+  const next = Math.max(msgId, cur ? cur.last_read_msg : 0);
+  await dbRun('INSERT INTO group_reads (group_id, user_id, last_read_msg) VALUES (?, ?, ?) ON CONFLICT(group_id, user_id) DO UPDATE SET last_read_msg = excluded.last_read_msg', [groupId, userId, next]);
+}
+async function groupUnreadCount(groupId, userId) {
+  const r = await dbGet('SELECT last_read_msg FROM group_reads WHERE group_id = ? AND user_id = ?', [groupId, userId]);
+  const lastRead = r ? r.last_read_msg : 0;
+  const row = await dbGet(
+    'SELECT COUNT(*) AS c FROM group_messages WHERE group_id = ? AND id > ? AND sender_id != ? AND deleted = 0',
+    [groupId, lastRead, userId]
+  );
+  return row.c;
+}
+async function groupLastMessage(groupId) {
+  const m = await dbGet(
+    `SELECT gm.*, u.username AS sender_username FROM group_messages gm
+     JOIN users u ON u.id = gm.sender_id
+     WHERE gm.group_id = ? AND gm.deleted = 0 ORDER BY gm.id DESC LIMIT 1`,
+    [groupId]
+  );
+  if (!m) return null;
+  const snippet = m.kind === 'audio' ? '🎤 Voice note' : String(m.body || '').slice(0, 80);
+  return { id: m.id, sender: m.sender_username, snippet, createdAt: m.created_at };
+}
+// Promote the longest-standing member to admin (used when the last admin leaves).
+async function promoteOldestMember(groupId) {
+  const r = await dbGet(
+    'SELECT user_id FROM group_members WHERE group_id = ? ORDER BY COALESCE(joined_at, 0) ASC, rowid ASC LIMIT 1',
+    [groupId]
+  );
+  if (r) await dbRun("UPDATE group_members SET role = 'admin' WHERE group_id = ? AND user_id = ?", [groupId, r.user_id]);
+  return r ? r.user_id : null;
+}
+// Delete a group and all its data (messages, members, reads, invites).
+async function deleteGroup(groupId) {
+  await dbRun('DELETE FROM group_messages WHERE group_id = ?', [groupId]);
+  await dbRun('DELETE FROM group_reads WHERE group_id = ?', [groupId]);
+  await dbRun('DELETE FROM group_invites WHERE group_id = ?', [groupId]);
+  await dbRun('DELETE FROM group_members WHERE group_id = ?', [groupId]);
+  await dbRun('DELETE FROM groups WHERE id = ?', [groupId]);
 }
 
 // Decoded byte length of a base64 string (Infinity on garbage).
@@ -1975,6 +2092,8 @@ app.get('/api/blocked', ah(async (req, res) => {
 
 // --- groups -----------------------------------------------------------------
 
+const GROUP_MAX_MEMBERS = 50;
+
 app.post('/api/groups/create', ah(async (req, res) => {
   const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
@@ -1985,6 +2104,7 @@ app.post('/api/groups/create', ah(async (req, res) => {
   for (const m of wanted) {
     const u = await getUserByUsername(m);
     if (u && u.id !== user.id) memberIds.add(u.id);
+    if (memberIds.size >= GROUP_MAX_MEMBERS) break;
   }
   const info = await dbRun('INSERT INTO groups (name, creator_id, created_at) VALUES (?, ?, ?)', [
     name,
@@ -1992,8 +2112,35 @@ app.post('/api/groups/create', ah(async (req, res) => {
     Date.now(),
   ]);
   const gid = Number(info.lastInsertRowid);
+  const now = Date.now();
   for (const id of memberIds) {
-    await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)', [gid, id]);
+    const role = id === user.id ? 'admin' : 'member';
+    await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)', [gid, id, role, now]);
+  }
+  res.json(await groupSummary(gid));
+}));
+
+// POST /api/groups {name, members} — alias of /api/groups/create (v7.1).
+app.post('/api/groups', ah(async (req, res) => {
+  req.url = '/api/groups/create';
+  // Re-dispatch to the create handler by calling it directly is complex; duplicate the logic via internal call.
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const name = String((req.body && req.body.name) || '').trim().slice(0, 80);
+  if (!name) return res.status(400).json({ error: 'bad_request', message: 'Group name required.' });
+  const wanted = Array.isArray(req.body.members) ? req.body.members : [];
+  const memberIds = new Set([user.id]);
+  for (const m of wanted) {
+    const u = await getUserByUsername(m);
+    if (u && u.id !== user.id) memberIds.add(u.id);
+    if (memberIds.size >= GROUP_MAX_MEMBERS) break;
+  }
+  const info = await dbRun('INSERT INTO groups (name, creator_id, created_at) VALUES (?, ?, ?)', [name, user.id, Date.now()]);
+  const gid = Number(info.lastInsertRowid);
+  const now = Date.now();
+  for (const id of memberIds) {
+    const role = id === user.id ? 'admin' : 'member';
+    await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)', [gid, id, role, now]);
   }
   res.json(await groupSummary(gid));
 }));
@@ -2004,8 +2151,30 @@ app.get('/api/groups', ah(async (req, res) => {
   const rows = await dbAll('SELECT group_id FROM group_members WHERE user_id = ? ORDER BY group_id DESC', [
     user.id,
   ]);
-  const groups = await Promise.all(rows.map(async (r) => await groupSummary(r.group_id)));
-  res.json({ groups: groups.filter(Boolean) });
+  const groups = [];
+  for (const r of rows) {
+    const s = await groupSummary(r.group_id);
+    if (!s) continue;
+    s.myRole = await getMemberRole(r.group_id, user.id);
+    s.memberRoles = await groupMemberRoles(r.group_id);
+    s.lastMessage = await groupLastMessage(r.group_id);
+    s.unreadCount = await groupUnreadCount(r.group_id, user.id);
+    groups.push(s);
+  }
+  res.json({ groups });
+}));
+
+// POST /api/groups/:id/read {lastReadMsg} — mark group messages read (v7.1).
+app.post('/api/groups/:id/read', rateLimit('group-read', 60), ah(async (req, res) => {
+  const user = await getApiUser(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const gid = Number(req.params.id);
+  if (!await isMember(gid, user.id)) {
+    return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+  }
+  const lastReadMsg = Number(req.body && req.body.lastReadMsg) || 0;
+  await markGroupRead(gid, user.id, lastReadMsg);
+  res.json({ ok: true });
 }));
 
 app.post('/api/groups/:id/add', ah(async (req, res) => {
@@ -2015,34 +2184,55 @@ app.post('/api/groups/:id/add', ah(async (req, res) => {
   if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
-  const target = await getUserByUsername(req.body && req.body.username);
-  if (!target) return res.status(404).json({ error: 'not_found', message: 'No such user.' });
-  if (await isMember(gid, target.id)) {
-    return res.status(400).json({ error: 'already_member', message: 'User is already in the group.' });
+  // v7.1: only admins may add members.
+  if (!await isGroupAdmin(gid, user.id)) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only group admins can add members.' });
   }
-  (await dbRun('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [gid, target.id]));
-  res.json(await groupSummary(gid));
+  const wanted = Array.isArray(req.body && req.body.members)
+    ? req.body.members
+    : (req.body && req.body.username ? [req.body.username] : []);
+  const added = [];
+  for (const m of wanted) {
+    if (await groupMemberCount(gid) >= GROUP_MAX_MEMBERS) break;
+    const target = await getUserByUsername(m);
+    if (!target || target.id === user.id || await isMember(gid, target.id)) continue;
+    await dbRun('INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)', [gid, target.id, 'member', Date.now()]);
+    added.push(target.username);
+  }
+  res.json({ ok: true, added, group: await groupSummary(gid), full: await groupMemberCount(gid) >= GROUP_MAX_MEMBERS });
 }));
 
 app.post('/api/groups/:id/remove', ah(async (req, res) => {
   const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const gid = Number(req.params.id);
-  if (!await groupSummary(gid) || !await isMember(gid, user.id)) {
+  const g = await dbGet('SELECT * FROM groups WHERE id = ?', [gid]);
+  if (!g || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
+  }
+  // v7.1: only admins may remove members.
+  if (!await isGroupAdmin(gid, user.id)) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only group admins can remove members.' });
   }
   const target = await getUserByUsername(req.body && req.body.username);
   if (!target || !await isMember(gid, target.id)) {
     return res.status(404).json({ error: 'not_member', message: 'User is not in the group.' });
   }
+  const targetRole = await getMemberRole(gid, target.id);
+  // Only the creator may remove another admin.
+  if (targetRole === 'admin' && g.creator_id !== user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the group creator can remove an admin.' });
+  }
+  if (target.id === user.id) {
+    return res.status(400).json({ error: 'bad_request', message: 'Use leave to remove yourself.' });
+  }
   (await dbRun('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [gid, target.id]));
-  const left = (await dbGet('SELECT COUNT(*) AS c FROM group_members WHERE group_id = ?', [gid])).c;
+  const left = await groupMemberCount(gid);
   if (left === 0) {
-    (await dbRun('DELETE FROM group_messages WHERE group_id = ?', [gid]));
-    (await dbRun('DELETE FROM groups WHERE id = ?', [gid]));
+    await deleteGroup(gid);
     return res.json({ ok: true, deleted: true });
   }
-  res.json(await groupSummary(gid));
+  res.json({ ok: true, group: await groupSummary(gid) });
 }));
 
 // POST /api/groups/:id/edit {name?, description?, avatar?} — creator only.
@@ -2069,7 +2259,9 @@ app.post('/api/groups/:id/edit', rateLimit('group-edit', 20), ah(async (req, res
   res.json({ ok: true, group: await groupSummary(gid) });
 }));
 
-// POST /api/groups/:id/leave — creator CANNOT leave (must delete the group instead).
+// POST /api/groups/:id/leave — any member (including creator/admin) may leave.
+// If the leaver was the last admin, the longest-standing member is promoted.
+// If the group is empty afterwards, it is deleted.
 app.post('/api/groups/:id/leave', rateLimit('group-leave', 20), ah(async (req, res) => {
   const user = await getApiUser(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
@@ -2078,14 +2270,30 @@ app.post('/api/groups/:id/leave', rateLimit('group-leave', 20), ah(async (req, r
   if (!g || !await isMember(gid, user.id)) {
     return res.status(404).json({ error: 'not_found', message: 'Group not found.' });
   }
-  if (g.creator_id === user.id) {
-    return res.status(403).json({
-      error: 'creator_cannot_leave',
-      message: 'The creator cannot leave. Delete the group instead.',
-    });
-  }
+  const wasAdmin = await isGroupAdmin(gid, user.id);
   await dbRun('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [gid, user.id]);
-  res.json({ ok: true });
+  await dbRun('DELETE FROM group_reads WHERE group_id = ? AND user_id = ?', [gid, user.id]);
+  const left = await groupMemberCount(gid);
+  if (left === 0) {
+    await deleteGroup(gid);
+    return res.json({ ok: true, deleted: true });
+  }
+  let promoted = null;
+  if (wasAdmin) {
+    const admins = await dbAll(
+      `SELECT gm.user_id FROM group_members gm
+       WHERE gm.group_id = ? AND (gm.role = 'admin' OR gm.user_id = ?)`,
+      [gid, g.creator_id]
+    );
+    if (!admins.length) {
+      const pid = await promoteOldestMember(gid);
+      if (pid) {
+        const pu = await getUserById(pid);
+        promoted = pu ? pu.username : null;
+      }
+    }
+  }
+  res.json({ ok: true, promoted });
 }));
 
 // POST /api/groups/:id/invite — generate an invite link code (any member can invite).
@@ -2116,7 +2324,7 @@ app.post('/api/groups/join', rateLimit('group-join', 20), ah(async (req, res) =>
   if (await isMember(inv.group_id, user.id)) {
     return res.json({ ok: true, already: true, group: g });
   }
-  await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)', [inv.group_id, user.id]);
+  await dbRun('INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)', [inv.group_id, user.id, 'member', Date.now()]);
   await dbRun('UPDATE group_invites SET uses = uses + 1 WHERE code = ?', [code]);
   res.json({ ok: true, group: await groupSummary(inv.group_id) });
 }));
@@ -2195,22 +2403,29 @@ app.post('/api/message/react', rateLimit('react', 60), ah(async (req, res) => {
   res.json({ ok: true, added, reactions });
 }));
 
-// POST /api/message/edit {messageId, newText} — edit your own DM text.
-// Rules: sender only, within 15 minutes of sending, 1–2000 chars. DMs only.
+// POST /api/message/edit {messageId, newText, scope} — edit your own text.
+// Rules: sender only, within 15 minutes of sending, 1–2000 chars. scope: 'dm' | 'group' (v7.1).
 app.post('/api/message/edit', rateLimit('editmsg', 60), ah(async (req, res) => {
   // Web UI: HttpOnly session cookie. API/Android: token via body/query/Bearer.
   const user = (await getUserFromReq(req)) || (await getApiUser(req));
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const msgId = Number(req.body && req.body.messageId);
   const newText = String((req.body && req.body.newText) || '').trim();
+  const scope = (req.body && req.body.scope) === 'group' ? 'group' : 'dm';
   if (!Number.isInteger(msgId) || msgId <= 0) {
     return res.status(400).json({ error: 'bad_request', message: 'messageId required.' });
   }
   if (!newText || [...newText].length > 2000) {
     return res.status(400).json({ error: 'bad_request', message: 'Text must be 1–2000 characters.' });
   }
-  const m = await dbGet('SELECT * FROM messages WHERE id = ?', [msgId]);
+  const table = scope === 'group' ? 'group_messages' : 'messages';
+  const m = await dbGet(`SELECT * FROM ${table} WHERE id = ?`, [msgId]);
   if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+  if (scope === 'group') {
+    if (!await isMember(m.group_id, user.id)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+  }
   if (m.sender_id !== user.id) {
     return res.status(403).json({ error: 'forbidden', message: 'Only the sender can edit a message.' });
   }
@@ -2218,30 +2433,36 @@ app.post('/api/message/edit', rateLimit('editmsg', 60), ah(async (req, res) => {
     return res.status(410).json({ error: 'edit_window_expired', message: 'Messages can only be edited within 15 minutes.' });
   }
   const now = Date.now();
-  await dbRun('UPDATE messages SET body = ?, edited = 1, edited_at = ? WHERE id = ?', [newText, now, msgId]);
-  // Notify the other party live.
-  await deliverTo(m.recipient_id, user.id, {
+  await dbRun(`UPDATE ${table} SET body = ?, edited = 1, edited_at = ? WHERE id = ?`, [newText, now, msgId]);
+  const payload = {
     type: 'message-edited',
     messageId: msgId,
-    scope: 'dm',
+    scope,
     newText,
     editedAt: now,
-  });
+  };
+  if (scope === 'dm') {
+    // Notify the other party live.
+    await deliverTo(m.recipient_id, user.id, payload);
+  } else {
+    payload.groupId = m.group_id;
+    const members = await dbAll('SELECT user_id FROM group_members WHERE group_id = ?', [m.group_id]);
+    for (const r of members) {
+      if (r.user_id !== user.id) await deliverTo(r.user_id, user.id, payload);
+    }
+  }
   res.json({ ok: true, messageId: msgId, newText, edited: true, editedAt: now });
 }));
 
 // POST /api/message/voice {to, audioBase64, mime?, durationSec} — send a voice
-// note as a DM (v6.8). Same result as WS {type:'send', kind:'audio'} but usable
-// over plain HTTP. DMs only. Audio capped at 1MB decoded (matches MAX_MEDIA_BYTES);
-// duration validated 1–600s (clients cap recording at 120s).
+// note as a DM (v6.8). v7.1: pass {groupId} instead of {to} to send to a group.
+// Same result as WS {type:'send', kind:'audio'} but usable over plain HTTP.
+// Audio capped at 1MB decoded (matches MAX_MEDIA_BYTES); duration 1–600s
+// (clients cap recording at 120s).
 app.post('/api/message/voice', rateLimit('voicemsg', 30), ah(async (req, res) => {
   // Web UI: HttpOnly session cookie. API/Android: token via body/query/Bearer.
   const user = (await getUserFromReq(req)) || (await getApiUser(req));
   if (!user) return res.status(401).json({ error: 'unauthorized' });
-  const partner = await resolveRecipient(req.body && req.body.to);
-  if (!partner || partner.id === user.id) {
-    return res.status(400).json({ error: 'bad_request', message: 'Valid recipient required.' });
-  }
   const b64 = typeof (req.body && req.body.audioBase64) === 'string' ? req.body.audioBase64 : '';
   const bytes = base64ByteLength(b64);
   if (bytes < 1 || bytes > MAX_MEDIA_BYTES) {
@@ -2253,6 +2474,26 @@ app.post('/api/message/voice', rateLimit('voicemsg', 30), ah(async (req, res) =>
   }
   const mime = typeof (req.body && req.body.mime) === 'string'
     ? String(req.body.mime).slice(0, 100) : 'audio/mp4';
+  const groupId = Number(req.body && req.body.groupId) || 0;
+  // ---- group voice note (v7.1) ----
+  if (groupId > 0) {
+    if (!await isMember(groupId, user.id)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+    const gm = await insertGroupMessage(groupId, user.id, { kind: 'audio', body: '', data: b64, mime, durationSec });
+    const clientMsg = await toClientGroupMessageFull(gm, user.username);
+    const payload = { type: 'group-message', groupId, from: user.username, fromId: user.id, message: clientMsg };
+    for (const member of await groupMemberRows(groupId)) {
+      if (member.id === user.id) continue;
+      await deliverTo(member.id, user.id, payload);
+    }
+    return res.json({ ok: true, scope: 'group', message: clientMsg });
+  }
+  // ---- DM voice note ----
+  const partner = await resolveRecipient(req.body && req.body.to);
+  if (!partner || partner.id === user.id) {
+    return res.status(400).json({ error: 'bad_request', message: 'Valid recipient required.' });
+  }
   const m = await insertMessage(user.id, partner.id, {
     kind: 'audio', body: '', data: b64, mime, durationSec,
   });
@@ -2275,7 +2516,7 @@ app.post('/api/message/voice', rateLimit('voicemsg', 30), ah(async (req, res) =>
   res.json({ ok: true, message: await toClientMessageFull(m) });
 }));
 
-// GET /api/message/:id/audio — fetch a voice note's bytes (v6.8).
+// GET /api/message/:id/audio — fetch a voice note's bytes (v6.8; v7.1: scope=group).
 // Participant-only: 403 for outsiders, 404 for missing/non-audio messages.
 app.get('/api/message/:id/audio', ah(async (req, res) => {
   const user = (await getUserFromReq(req)) || (await getApiUser(req));
@@ -2284,11 +2525,17 @@ app.get('/api/message/:id/audio', ah(async (req, res) => {
   if (!Number.isInteger(msgId) || msgId <= 0) {
     return res.status(400).json({ error: 'bad_request', message: 'Message id required.' });
   }
-  const m = await dbGet('SELECT * FROM messages WHERE id = ?', [msgId]);
+  const scope = (req.query && req.query.scope) === 'group' ? 'group' : 'dm';
+  const table = scope === 'group' ? 'group_messages' : 'messages';
+  const m = await dbGet(`SELECT * FROM ${table} WHERE id = ?`, [msgId]);
   if (!m || m.kind !== 'audio' || m.deleted) {
     return res.status(404).json({ error: 'not_found', message: 'Voice note not found.' });
   }
-  if (m.sender_id !== user.id && m.recipient_id !== user.id) {
+  if (scope === 'group') {
+    if (!await isMember(m.group_id, user.id)) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
+    }
+  } else if (m.sender_id !== user.id && m.recipient_id !== user.id) {
     return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
   }
   res.json({
@@ -2462,12 +2709,12 @@ app.get('/api/groups/:id/history', ah(async (req, res) => {
     rows.reverse();
   }
   const blocked = await blockedIds(user.id);
-  res.json({
-    groupId: gid,
-    messages: rows
-      .filter((m) => !blocked.has(m.sender_id))
-      .map((m) => toClientGroupMessage(m, m.sender_username)),
-  });
+  const messages = [];
+  for (const m of rows) {
+    if (blocked.has(m.sender_id)) continue;
+    messages.push(await toClientGroupMessageFull(m, m.sender_username));
+  }
+  res.json({ groupId: gid, messages });
 }));
 
 // --- statuses (24h stories) --------------------------------------------------
@@ -3087,11 +3334,26 @@ app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
     if (!(await isMember(m.group_id, userId))) {
       return res.status(403).json({ error: 'forbidden', message: 'Not a group member.' });
     }
-    if (forEveryone) {
+    // v7.1: mode 'everyone'|'me'; legacy clients send {forEveryone: bool}.
+    let mode = req.body && req.body.mode;
+    if (mode !== 'everyone' && mode !== 'me') {
+      if (mode == null || mode === '') {
+        mode = (req.body && req.body.forEveryone) ? 'everyone' : 'me';
+      } else {
+        return res.status(400).json({ error: 'bad_request', message: 'Mode must be everyone or me.' });
+      }
+    }
+    if (mode === 'everyone') {
       if (m.sender_id !== userId) {
         return res.status(403).json({ error: 'forbidden', message: 'Only the sender can delete for everyone.' });
       }
-      await dbRun('UPDATE group_messages SET deleted = 1 WHERE id = ?', [messageId]);
+      if (Date.now() - m.created_at > DELETE_EVERYONE_WINDOW_MS) {
+        return res.status(410).json({ error: 'expired', message: 'Delete-for-everyone window (48h) has expired.' });
+      }
+      await dbRun(
+        'UPDATE group_messages SET body = ?, deleted = 1, deleted_at = ?, reactions = ?, data = NULL WHERE id = ?',
+        [DELETED_PLACEHOLDER, Date.now(), '{}', messageId]
+      );
       // Notify all other group members
       const members = await dbAll('SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?',
         [m.group_id, userId]);
@@ -3230,7 +3492,7 @@ app.get('/api/starred', requireApiUser, ah(async (req, res) => {
       if (!m || !(await isMember(m.group_id, req.user.id))) continue;
       const g = await dbGet('SELECT * FROM groups WHERE id = ?', [m.group_id]);
       const su = await dbGet('SELECT username FROM users WHERE id = ?', [m.sender_id]);
-      const cm = toClientGroupMessage(m, su && su.username);
+      const cm = await toClientGroupMessageFull(m, su && su.username);
       cm.chatName = g ? g.name : 'Group';
       cm.chatKey = String(m.group_id);
       cm.chatKind = 'group';
@@ -3468,7 +3730,21 @@ wss.on('connection', async (ws, req) => {
     }
 
     // ---- typing ------------------------------------------------------------
+    // {type:"typing", to} for DMs; {type:"typing", groupId} for groups (v7.1).
     if (msg.type === 'typing') {
+      const gid = Number(msg.groupId || 0);
+      if (gid > 0) {
+        if (!await isMember(gid, userId)) return;
+        const members = await dbAll('SELECT user_id FROM group_members WHERE group_id = ?', [gid]);
+        for (const r of members) {
+          if (r.user_id === userId) continue;
+          await deliverTo(r.user_id, userId, {
+            type: 'typing', from: userId, fromName: user.username,
+            typing: !!msg.typing, groupId: gid,
+          });
+        }
+        return;
+      }
       const partner = await resolveRecipient(msg.to);
       if (!partner) return;
       await deliverTo(partner.id, userId, { type: 'typing', from: userId, typing: !!msg.typing });
@@ -3551,9 +3827,21 @@ wss.on('connection', async (ws, req) => {
         return;
       }
       if (!content) return;
+      // v7.1: replies + voice duration passthrough for group messages.
+      if (msg.replyTo != null) content.replyTo = msg.replyTo;
+      if (content.kind === 'audio' && Number.isInteger(msg.durationSec)) content.durationSec = msg.durationSec;
 
-      const gm = await insertGroupMessage(groupId, userId, content);
-      const clientMsg = toClientGroupMessage(gm, user.username);
+      let gm;
+      try {
+        gm = await insertGroupMessage(groupId, userId, content);
+      } catch (e) {
+        if (e && e.code === 'bad_reply_to') {
+          ws.send(JSON.stringify({ type: 'error', error: 'bad_reply_to', tempId: msg.tempId || null }));
+          return;
+        }
+        throw e;
+      }
+      const clientMsg = await toClientGroupMessageFull(gm, user.username);
       const payload = {
         type: 'group-message',
         groupId,
