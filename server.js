@@ -268,6 +268,10 @@ async function initDb() {
   await ensureColumn('messages', 'view_once', 'INTEGER NOT NULL DEFAULT 0'); // 1 = view-once image/voice
   await ensureColumn('messages', 'viewed_at', 'INTEGER'); // epoch ms when the recipient viewed it
 
+// --- v4.2 migrations: message editing (DMs) ----------------------------------
+  await ensureColumn('messages', 'edited', 'INTEGER NOT NULL DEFAULT 0'); // 1 = text was edited
+  await ensureColumn('messages', 'edited_at', 'INTEGER'); // epoch ms of last edit
+
 // --- v3.8 migrations: passwordless auth (phone + email-code) ----------------
   await ensureColumn('users', 'phone', 'TEXT'); // E.164 phone for Firebase phone auth
   await db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
@@ -799,6 +803,8 @@ function toClientMessage(m) {
     expireAt: m.expire_at || null,
     status: m.status,
     createdAt: m.created_at,
+    edited: !!m.edited,
+    editedAt: m.edited_at || null,
     viewOnce,
     viewed,
   };
@@ -2130,6 +2136,41 @@ app.post('/api/message/react', rateLimit('react', 60), ah(async (req, res) => {
     }
   }
   res.json({ ok: true, added, reactions });
+}));
+
+// POST /api/message/edit {messageId, newText} — edit your own DM text.
+// Rules: sender only, within 15 minutes of sending, 1–2000 chars. DMs only.
+app.post('/api/message/edit', rateLimit('editmsg', 60), ah(async (req, res) => {
+  // Web UI: HttpOnly session cookie. API/Android: token via body/query/Bearer.
+  const user = (await getUserFromReq(req)) || (await getApiUser(req));
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const msgId = Number(req.body && req.body.messageId);
+  const newText = String((req.body && req.body.newText) || '').trim();
+  if (!Number.isInteger(msgId) || msgId <= 0) {
+    return res.status(400).json({ error: 'bad_request', message: 'messageId required.' });
+  }
+  if (!newText || [...newText].length > 2000) {
+    return res.status(400).json({ error: 'bad_request', message: 'Text must be 1–2000 characters.' });
+  }
+  const m = await dbGet('SELECT * FROM messages WHERE id = ?', [msgId]);
+  if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
+  if (m.sender_id !== user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the sender can edit a message.' });
+  }
+  if (Date.now() - m.created_at > 15 * 60 * 1000) {
+    return res.status(410).json({ error: 'edit_window_expired', message: 'Messages can only be edited within 15 minutes.' });
+  }
+  const now = Date.now();
+  await dbRun('UPDATE messages SET body = ?, edited = 1, edited_at = ? WHERE id = ?', [newText, now, msgId]);
+  // Notify the other party live.
+  await deliverTo(m.recipient_id, user.id, {
+    type: 'message-edited',
+    messageId: msgId,
+    scope: 'dm',
+    newText,
+    editedAt: now,
+  });
+  res.json({ ok: true, messageId: msgId, newText, edited: true, editedAt: now });
 }));
 
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,

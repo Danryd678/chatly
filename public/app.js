@@ -279,7 +279,8 @@ function renderMessages() {
     const ticks = mine
       ? `<span class="ticks${m.status === 2 ? ' read' : ''}" data-ticks>${m.status === 0 ? '✓' : '✓✓'}</span>`
       : '';
-    b.innerHTML = `${esc(m.body)}<span class="meta">${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+    const editedTag = m.edited ? '<span class="edited-tag">edited</span>' : '';
+    b.innerHTML = `${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
     wireBubbleReactions(b, m);
     box.appendChild(b);
   }
@@ -330,18 +331,21 @@ function reactionPillsHtml(m) {
 function wireBubbleReactions(b, m) {
   if (!m || !m.id) return; // optimistic temp message — no id yet
   b.addEventListener('click', (ev) => {
+    if (b.classList.contains('editing')) return;
     const pill = ev.target.closest('.rpill');
     if (pill) reactTo(m, pill.dataset.emoji);
   });
   let lpTimer = null;
   const cancelLp = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } };
   b.addEventListener('touchstart', () => {
+    if (b.classList.contains('editing')) return;
     cancelLp();
     lpTimer = setTimeout(() => { lpTimer = null; showReactPicker(m, b); }, 550);
   }, { passive: true });
   b.addEventListener('touchend', cancelLp);
   b.addEventListener('touchmove', cancelLp);
   b.addEventListener('contextmenu', (ev) => {
+    if (b.classList.contains('editing')) return;
     ev.preventDefault();
     showReactPicker(m, b);
   });
@@ -351,12 +355,23 @@ function showReactPicker(m, b) {
   hideReactPicker();
   const pk = document.createElement('div');
   pk.id = 'react-picker';
+  const row = document.createElement('div');
+  row.className = 'react-emoji-row';
   for (const e of REACT_EMOJIS) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = e;
     btn.onclick = (ev) => { ev.stopPropagation(); reactTo(m, e); };
-    pk.appendChild(btn);
+    row.appendChild(btn);
+  }
+  pk.appendChild(row);
+  if (canEditMessage(m)) {
+    const eb = document.createElement('button');
+    eb.type = 'button';
+    eb.className = 'picker-edit';
+    eb.textContent = '✏️ Edit message';
+    eb.onclick = (ev) => { ev.stopPropagation(); hideReactPicker(); startInlineEdit(m); };
+    pk.appendChild(eb);
   }
   document.body.appendChild(pk);
   const r = b.getBoundingClientRect();
@@ -385,6 +400,55 @@ async function reactTo(m, emoji) {
   } catch (err) {
     // transient — picker already closed; stay quiet
   }
+}
+
+// ---------------------------------------------------------------- edit message (web)
+
+const EDIT_WINDOW_MS = 15 * 60 * 1000;
+
+function canEditMessage(m) {
+  return !!(m && m.id && state.me && m.senderId === state.me.id &&
+    (Date.now() - m.createdAt < EDIT_WINDOW_MS));
+}
+
+function startInlineEdit(m) {
+  const b = document.querySelector(`.bubble[data-id="${m.id}"]`);
+  if (!b) return;
+  b.classList.add('editing');
+  const ta = document.createElement('textarea');
+  ta.className = 'edit-box';
+  ta.value = m.body;
+  const bar = document.createElement('div');
+  bar.className = 'edit-bar';
+  const save = document.createElement('button');
+  save.type = 'button'; save.className = 'edit-save'; save.textContent = 'Save';
+  const cancel = document.createElement('button');
+  cancel.type = 'button'; cancel.className = 'edit-cancel'; cancel.textContent = 'Cancel';
+  bar.append(save, cancel);
+  b.innerHTML = '';
+  b.append(ta, bar);
+  ta.focus();
+  try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+  cancel.onclick = () => renderMessages();
+  save.onclick = async () => {
+    const text = ta.value.trim();
+    if (!text || text.length > 2000) { ta.focus(); return; }
+    save.disabled = true;
+    try {
+      const data = await api('/api/message/edit', {
+        method: 'POST',
+        body: JSON.stringify({ messageId: m.id, newText: text }),
+      });
+      m.body = data.newText;
+      m.edited = true;
+      m.editedAt = data.editedAt;
+      renderMessages();
+      loadChats(); // chat preview may still show the old text
+    } catch (err) {
+      save.disabled = false;
+      alert(err.message);
+    }
+  };
 }
 
 // --- sending
@@ -483,6 +547,18 @@ function handleWs(msg) {
       if (m) {
         m.reactions = msg.reactions || {};
         renderMessages();
+      }
+      break;
+    }
+
+    case 'message-edited': {
+      const m = state.active?.messages.find((x) => x.id === msg.messageId);
+      if (m) {
+        m.body = msg.newText;
+        m.edited = true;
+        m.editedAt = msg.editedAt;
+        renderMessages();
+        loadChats();
       }
       break;
     }
