@@ -1029,6 +1029,19 @@ $('btn-back').onclick = () => { state.active = null; show('view-chats'); loadCha
 $('btn-back-profile').onclick = () => show('view-chats');
 $('btn-profile').onclick = () => show('view-profile');
 
+// v7.0: chat export — download full DM history as text or JSON (server endpoint).
+$('btn-export').onclick = () => {
+  if (!state.active) return;
+  const pick = prompt('Export chat as:\n1 — Text (.txt)\n2 — JSON (.json)', '1');
+  if (pick === null) return;
+  const format = String(pick).trim() === '2' ? 'json' : 'text';
+  const a = document.createElement('a');
+  a.href = `/api/export/chat/${state.active.partnerId}?format=${format}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+};
+
 function renderProfile() {
   if (!state.me) return;
   $('profile-username').textContent = state.me.username;
