@@ -2077,7 +2077,8 @@ app.post('/api/change-username', rateLimit('change-username', 10), ah(async (req
 // POST /api/message/react {messageId, emoji, scope} — toggle an emoji reaction.
 // scope: 'dm' | 'group'. Persists in the reactions JSON column and notifies via WS.
 app.post('/api/message/react', rateLimit('react', 60), ah(async (req, res) => {
-  const user = await getApiUser(req);
+  // Web UI: HttpOnly session cookie. API/Android: token via body/query/Bearer.
+  const user = (await getUserFromReq(req)) || (await getApiUser(req));
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   const msgId = Number(req.body && req.body.messageId);
   const emoji = String((req.body && req.body.emoji) || '').trim();

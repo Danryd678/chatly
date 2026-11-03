@@ -279,7 +279,8 @@ function renderMessages() {
     const ticks = mine
       ? `<span class="ticks${m.status === 2 ? ' read' : ''}" data-ticks>${m.status === 0 ? '✓' : '✓✓'}</span>`
       : '';
-    b.innerHTML = `${esc(m.body)}<span class="meta">${fmtTime(m.createdAt)}${ticks}</span>`;
+    b.innerHTML = `${esc(m.body)}<span class="meta">${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+    wireBubbleReactions(b, m);
     box.appendChild(b);
   }
   box.scrollTop = box.scrollHeight;
@@ -310,6 +311,79 @@ function applyReceipt(ids, status) {
       }
     }
     if (changed) loadChats(); // keep preview ticks in sync
+  }
+}
+
+// ---------------------------------------------------------------- reactions (web)
+
+const REACT_EMOJIS = ['😀', '❤️', '😂', '😮', '😢', '🙏', '👍', '👎'];
+
+function reactionPillsHtml(m) {
+  const r = m.reactions || {};
+  const keys = Object.keys(r).filter((e) => Array.isArray(r[e]) && r[e].length);
+  if (!keys.length) return '';
+  return '<div class="react-pills">' + keys.map((e) =>
+    `<span class="rpill" data-emoji="${esc(e)}">${esc(e)}<b>${r[e].length}</b></span>`
+  ).join('') + '</div>';
+}
+
+function wireBubbleReactions(b, m) {
+  if (!m || !m.id) return; // optimistic temp message — no id yet
+  b.addEventListener('click', (ev) => {
+    const pill = ev.target.closest('.rpill');
+    if (pill) reactTo(m, pill.dataset.emoji);
+  });
+  let lpTimer = null;
+  const cancelLp = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } };
+  b.addEventListener('touchstart', () => {
+    cancelLp();
+    lpTimer = setTimeout(() => { lpTimer = null; showReactPicker(m, b); }, 550);
+  }, { passive: true });
+  b.addEventListener('touchend', cancelLp);
+  b.addEventListener('touchmove', cancelLp);
+  b.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    showReactPicker(m, b);
+  });
+}
+
+function showReactPicker(m, b) {
+  hideReactPicker();
+  const pk = document.createElement('div');
+  pk.id = 'react-picker';
+  for (const e of REACT_EMOJIS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = e;
+    btn.onclick = (ev) => { ev.stopPropagation(); reactTo(m, e); };
+    pk.appendChild(btn);
+  }
+  document.body.appendChild(pk);
+  const r = b.getBoundingClientRect();
+  pk.style.left = Math.max(8, Math.min(window.innerWidth - pk.offsetWidth - 8, r.left)) + 'px';
+  pk.style.top = Math.max(8, r.top - pk.offsetHeight - 8) + 'px';
+  setTimeout(() => {
+    document.addEventListener('click', hideReactPicker, { once: true });
+  }, 0);
+}
+
+function hideReactPicker() {
+  const pk = document.getElementById('react-picker');
+  if (pk) pk.remove();
+}
+
+async function reactTo(m, emoji) {
+  hideReactPicker();
+  try {
+    // session cookie authenticates the web UI (server falls back to it)
+    const data = await api('/api/message/react', {
+      method: 'POST',
+      body: JSON.stringify({ messageId: m.id, emoji, scope: 'dm' }),
+    });
+    m.reactions = data.reactions;
+    renderMessages();
+  } catch (err) {
+    // transient — picker already closed; stay quiet
   }
 }
 
@@ -403,6 +477,15 @@ function handleWs(msg) {
     case 'receipt':
       applyReceipt(msg.ids || [], msg.status || 0);
       break;
+
+    case 'message-reaction': {
+      const m = state.active?.messages.find((x) => x.id === msg.messageId);
+      if (m) {
+        m.reactions = msg.reactions || {};
+        renderMessages();
+      }
+      break;
+    }
 
     case 'typing': {
       if (state.typing.has(msg.from)) clearTimeout(state.typing.get(msg.from));
