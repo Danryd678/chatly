@@ -6,16 +6,23 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   me: null,
-  chats: [],            // conversation list
-  active: null,         // { partnerId, username, messages: [] }
+  chats: [],            // DM conversation list
+  groups: [],           // group list (v7.1)
+  active: null,         // { kind:'dm'|'group', partnerId, username, groupId, groupName, messages: [], myRole }
   online: new Set(),    // online user ids
   ws: null,
   wsTimer: null,
   typing: new Map(),    // userId -> timeout id for "typing" indicator
+  groupTyping: new Map(), // groupId -> Map(username -> timeout id) (v7.1)
   tempSeq: 0,
   authMode: 'login',
   replyTo: null,        // v6.7: { id, sender, snippet } — message being replied to
 };
+
+// v7.1: message scope for the active conversation ('group' inside a group chat).
+function msgScope() {
+  return (state.active && state.active.kind === 'group') ? 'group' : 'dm';
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -101,6 +108,7 @@ async function boot() {
   show('view-chats');
   connectWs();
   await loadChats();
+  await loadGroups(); // v7.1
   renderProfile();
 }
 
@@ -120,7 +128,11 @@ function connectWs() {
     $('conn-banner-convo').hidden = true;
     // re-sync state after (re)connect
     loadChats();
-    if (state.active) openChat(state.active.partnerId, state.active.username);
+    loadGroups(); // v7.1
+    if (state.active) {
+      if (state.active.kind === 'group') openGroup(state.active.groupId);
+      else openChat(state.active.partnerId, state.active.username);
+    }
   };
   ws.onclose = () => {
     $('conn-banner').hidden = false;
@@ -152,10 +164,29 @@ async function loadChats() {
   renderChats();
 }
 
+// v7.1: groups
+async function loadGroups() {
+  try {
+    const data = await api('/api/groups');
+    state.groups = data.groups || [];
+  } catch {
+    state.groups = [];
+  }
+  renderChats();
+}
+
+function groupPreviewText(last) {
+  if (!last) return '';
+  const who = last.sender ? esc(last.sender) + ': ' : '';
+  return who + esc(last.snippet.slice(0, 60));
+}
+
 function renderChats() {
   const list = $('chat-list');
   list.innerHTML = '';
-  $('chats-empty').hidden = state.chats.length > 0;
+  const dmCount = state.chats.length;
+  const gCount = state.groups.length;
+  $('chats-empty').hidden = (dmCount + gCount) > 0;
 
   for (const c of state.chats) {
     const li = document.createElement('li');
@@ -182,6 +213,25 @@ function renderChats() {
     li.onclick = () => openChat(p.id, p.username);
     list.appendChild(li);
   }
+
+  // ---- groups (v7.1) ----
+  for (const g of state.groups) {
+    const li = document.createElement('li');
+    const last = g.lastMessage;
+    const unread = g.unreadCount;
+    li.innerHTML = `
+      <div class="avatar group-avatar" style="background:${avatarColor(g.name)}">👥</div>
+      <div class="chat-meta">
+        <div class="chat-name"><span>${esc(g.name)}</span>
+          <span class="time">${last ? fmtTime(last.createdAt) : ''}</span></div>
+        <div class="chat-preview">
+          <span>${groupPreviewText(last)}</span>
+          ${unread ? `<span class="unread">${unread}</span>` : ''}
+        </div>
+      </div>`;
+    li.onclick = () => openGroup(g.groupId);
+    list.appendChild(li);
+  }
 }
 
 function bumpUnread(partnerId, partnerUsername, message) {
@@ -204,6 +254,9 @@ $('btn-newchat').onclick = () => {
   panel.hidden = !panel.hidden;
   if (!panel.hidden) $('input-search').focus();
 };
+
+// v7.1: new group
+$('btn-newgroup').onclick = () => openNewGroupModal();
 
 let searchTimer = null;
 $('input-search').addEventListener('input', () => {
@@ -332,9 +385,10 @@ function refreshConvoHeader() {
 
 async function openChat(partnerId, username) {
   stopVoiceNote();
-  state.active = { partnerId, username, messages: [] };
+  state.active = { kind: 'dm', partnerId, username, messages: [] };
   $('convo-name').textContent = username;
   $('messages').innerHTML = '';
+  $('btn-export').style.display = '';
   show('view-convo');
   refreshConvoHeader();
   try {
@@ -348,6 +402,12 @@ async function openChat(partnerId, username) {
     $('messages').innerHTML = `<p class="empty">Couldn't load messages.</p>`;
   }
 }
+
+// v7.1: tap the convo header to open the group info panel (groups only).
+$('convo-name').style.cursor = 'pointer';
+$('convo-name').onclick = () => {
+  if (state.active && state.active.kind === 'group') openGroupPanel();
+};
 
 function renderMessages() {
   const box = $('messages');
@@ -370,13 +430,17 @@ function renderMessages() {
       ? `<span class="ticks${m.status === 2 ? ' read' : ''}" data-ticks>${m.status === 0 ? '✓' : '✓✓'}</span>`
       : '';
     const editedTag = m.edited ? '<span class="edited-tag">edited</span>' : '';
+    // v7.1: in groups, show the sender's name on other people's bubbles.
+    const senderTag = (state.active && state.active.kind === 'group' && !mine && !m.deleted)
+      ? `<div class="sender-name" style="color:${avatarColor(m.senderUsername || m.sender || '?')}">${esc(m.senderUsername || m.sender || '?')}</div>`
+      : '';
     if (m.deleted) {
-      b.innerHTML = `<span class="deleted-text">🚫 This message was deleted</span><span class="meta">${fmtTime(m.createdAt)}${ticks}</span>`;
+      b.innerHTML = `${senderTag}<span class="deleted-text">🚫 This message was deleted</span><span class="meta">${fmtTime(m.createdAt)}${ticks}</span>`;
     } else if (m.kind === 'audio' && m.data) {
       const uid = m.id != null ? m.id : m.tempId;
-      b.innerHTML = `${m.body ? esc(m.body) : ''}<div class="voice-row"><button type="button" class="voice-play" data-vplay="${uid}" aria-label="Play voice note">▶</button><div class="voice-track" data-vtrack="${uid}"><div class="voice-fill" data-vfill="${uid}"></div></div><span class="voice-dur">${fmtDur(m.durationSec)}</span></div><span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+      b.innerHTML = `${senderTag}${m.body ? esc(m.body) : ''}<div class="voice-row"><button type="button" class="voice-play" data-vplay="${uid}" aria-label="Play voice note">▶</button><div class="voice-track" data-vtrack="${uid}"><div class="voice-fill" data-vfill="${uid}"></div></div><span class="voice-dur">${fmtDur(m.durationSec)}</span></div><span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
     } else {
-      b.innerHTML = `${replyQuoteHtml(m)}${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+      b.innerHTML = `${senderTag}${replyQuoteHtml(m)}${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
     }
     wireBubbleReactions(b, m);
     const qb = b.querySelector('.quote-block');
@@ -412,6 +476,256 @@ function applyReceipt(ids, status) {
     }
     if (changed) loadChats(); // keep preview ticks in sync
   }
+}
+
+// ---------------------------------------------------------------- groups (v7.1)
+
+function findGroup(groupId) {
+  return state.groups.find((g) => String(g.groupId) === String(groupId));
+}
+
+function groupStatusText(g) {
+  const typing = state.groupTyping.get(String(g.groupId));
+  if (typing && typing.size) {
+    const names = [...typing.keys()].slice(0, 2).join(', ');
+    return `${names} typing…`;
+  }
+  const n = (g.members || []).length;
+  return `${n} member${n === 1 ? '' : 's'}`;
+}
+
+function refreshGroupHeader() {
+  if (!state.active || state.active.kind !== 'group') return;
+  const g = findGroup(state.active.groupId) || state.active.group;
+  if (!g) return;
+  $('convo-name').textContent = '👥 ' + g.name;
+  const s = $('convo-status');
+  s.textContent = groupStatusText(g);
+  s.classList.remove('typing');
+}
+
+async function openGroup(groupId) {
+  stopVoiceNote();
+  let g = findGroup(groupId);
+  state.active = { kind: 'group', groupId: String(groupId), groupName: g ? g.name : 'Group', messages: [], group: g || null, myRole: g ? g.myRole : null };
+  $('convo-name').textContent = '👥 ' + state.active.groupName;
+  $('messages').innerHTML = '';
+  $('btn-export').style.display = 'none'; // export is DM-only for now
+  show('view-convo');
+  refreshGroupHeader();
+  try {
+    const data = await api('/api/groups/' + encodeURIComponent(groupId) + '/history?limit=50');
+    state.active.messages = data.messages || [];
+    // refresh group meta (roles may have changed)
+    await loadGroups();
+    const g2 = findGroup(groupId);
+    if (g2 && state.active && state.active.kind === 'group') {
+      state.active.group = g2;
+      state.active.groupName = g2.name;
+      state.active.myRole = g2.myRole;
+      $('convo-name').textContent = '👥 ' + g2.name;
+    }
+    renderMessages();
+    markGroupRead();
+  } catch (err) {
+    $('messages').innerHTML = `<p class="empty">Couldn't load group messages.</p>`;
+  }
+}
+
+async function markGroupRead() {
+  if (!state.active || state.active.kind !== 'group') return;
+  const msgs = state.active.messages;
+  if (!msgs.length) return;
+  const lastId = Math.max(...msgs.map((m) => m.id || 0));
+  try {
+    await api('/api/groups/' + encodeURIComponent(state.active.groupId) + '/read', {
+      method: 'POST',
+      body: JSON.stringify({ lastReadMsg: lastId }),
+    });
+    const g = findGroup(state.active.groupId);
+    if (g) g.unreadCount = 0;
+    renderChats();
+  } catch {}
+}
+
+function bumpGroupUnread(groupId, message) {
+  let g = findGroup(groupId);
+  if (!g) { loadGroups(); return; }
+  g.lastMessage = {
+    id: message.id,
+    sender: message.senderUsername || message.from,
+    snippet: message.kind === 'audio' ? '🎤 Voice note' : String(message.body || '').slice(0, 80),
+    createdAt: message.createdAt,
+  };
+  g.unreadCount = (g.unreadCount || 0) + 1;
+  // move to top
+  state.groups = [g, ...state.groups.filter((x) => x !== g)];
+  renderChats();
+}
+
+function appendGroupIncoming(m) {
+  if (!state.active || state.active.kind !== 'group' ||
+      String(state.active.groupId) !== String(m.groupId)) return false;
+  state.active.messages.push(m);
+  renderMessages();
+  markGroupRead();
+  return true;
+}
+
+// ---- group info panel ----
+
+function closeGroupPanel() {
+  const p = $('group-panel');
+  if (p) p.remove();
+}
+
+function openGroupPanel() {
+  if (!state.active || state.active.kind !== 'group') return;
+  closeGroupPanel();
+  const g = findGroup(state.active.groupId) || state.active.group;
+  if (!g) return;
+  const isAdmin = state.active.myRole === 'admin' || g.myRole === 'admin';
+  const roles = g.memberRoles || {};
+  const members = (g.members || []).map((u) => {
+    const role = roles[u] || 'member';
+    const crown = role === 'admin' ? ' 👑' : '';
+    // v7.1: admins see the remove button (server enforces creator-removes-admin).
+    const canRemove = isAdmin && u !== state.me.username;
+    return `<li class="gmember"><span class="avatar small" style="background:${avatarColor(u)}">${esc(u[0].toUpperCase())}</span>
+      <span class="gmember-name">${esc(u)}${crown}</span>
+      ${canRemove ? `<button class="link-btn" data-remove="${esc(u)}">Remove</button>` : ''}</li>`;
+  }).join('');
+  const p = document.createElement('div');
+  p.id = 'group-panel';
+  p.className = 'modal-overlay';
+  p.innerHTML = `
+    <div class="modal">
+      <div class="modal-head"><h3>${esc(g.name)}</h3>
+        <button class="icon-btn" id="gp-close" aria-label="Close">✕</button></div>
+      <p class="muted">${esc(g.description || '')}</p>
+      <h4>Members (${(g.members || []).length})</h4>
+      <ul class="gmember-list">${members}</ul>
+      ${isAdmin ? `<div class="row"><input id="gp-add-input" placeholder="Add member by username…" />
+        <button id="gp-add-btn" class="btn-small">Add</button></div>` : ''}
+      <div class="row"><button id="gp-leave" class="btn-danger">Leave group</button></div>
+    </div>`;
+  document.body.appendChild(p);
+  $('gp-close').onclick = closeGroupPanel;
+  p.addEventListener('click', (e) => { if (e.target === p) closeGroupPanel(); });
+  p.querySelectorAll('[data-remove]').forEach((btn) => {
+    btn.onclick = async () => {
+      const u = btn.dataset.remove;
+      if (!window.confirm(`Remove ${u} from the group?`)) return;
+      try {
+        await api('/api/groups/' + encodeURIComponent(g.groupId) + '/remove', {
+          method: 'POST', body: JSON.stringify({ username: u }),
+        });
+        closeGroupPanel();
+        await loadGroups();
+        openGroupPanel();
+      } catch (err) { alert(err.message); }
+    };
+  });
+  const addBtn = $('gp-add-btn');
+  if (addBtn) {
+    addBtn.onclick = async () => {
+      const u = $('gp-add-input').value.trim();
+      if (!u) return;
+      try {
+        const data = await api('/api/groups/' + encodeURIComponent(g.groupId) + '/add', {
+          method: 'POST', body: JSON.stringify({ username: u }),
+        });
+        if (!data.ok || !(data.added || []).length) {
+          alert(data.full ? 'Group is full (50 members)' : "Couldn't add " + u);
+          return;
+        }
+        closeGroupPanel();
+        await loadGroups();
+        openGroupPanel();
+      } catch (err) { alert(err.message); }
+    };
+  }
+  $('gp-leave').onclick = async () => {
+    if (!window.confirm('Leave this group?')) return;
+    try {
+      const data = await api('/api/groups/' + encodeURIComponent(g.groupId) + '/leave', { method: 'POST', body: '{}' });
+      closeGroupPanel();
+      if (data.promoted) alert(`${data.promoted} is now an admin.`);
+      state.active = null;
+      show('view-chats');
+      await loadGroups();
+    } catch (err) { alert(err.message); }
+  };
+}
+
+// ---- new group modal ----
+
+function closeNewGroupModal() {
+  const m = $('newgroup-modal');
+  if (m) m.remove();
+}
+
+function openNewGroupModal() {
+  closeNewGroupModal();
+  const picked = new Map(); // username -> true
+  const m = document.createElement('div');
+  m.id = 'newgroup-modal';
+  m.className = 'modal-overlay';
+  m.innerHTML = `
+    <div class="modal">
+      <div class="modal-head"><h3>New group</h3>
+        <button class="icon-btn" id="ng-close" aria-label="Close">✕</button></div>
+      <input id="ng-name" placeholder="Group name…" maxlength="80" />
+      <input id="ng-search" type="search" placeholder="Add members — search username…" />
+      <div id="ng-chips" class="chips"></div>
+      <ul id="ng-results" class="user-list"></ul>
+      <button id="ng-create" class="btn-primary">Create group</button>
+    </div>`;
+  document.body.appendChild(m);
+  $('ng-close').onclick = closeNewGroupModal;
+  m.addEventListener('click', (e) => { if (e.target === m) closeNewGroupModal(); });
+
+  const renderChips = () => {
+    $('ng-chips').innerHTML = [...picked.keys()]
+      .map((u) => `<span class="chip">${esc(u)}<button data-unpick="${esc(u)}">✕</button></span>`).join('');
+    m.querySelectorAll('[data-unpick]').forEach((b) => {
+      b.onclick = () => { picked.delete(b.dataset.unpick); renderChips(); };
+    });
+  };
+  let timer = null;
+  $('ng-search').addEventListener('input', (e) => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const q = e.target.value.trim();
+      const ul = $('ng-results');
+      ul.innerHTML = '';
+      if (!q) return;
+      try {
+        const data = await api('/api/users?q=' + encodeURIComponent(q));
+        for (const u of data.users || []) {
+          if (picked.has(u.username)) continue;
+          const li = document.createElement('li');
+          li.innerHTML = `<span class="avatar small" style="background:${avatarColor(u.username)}">${esc(u.username[0].toUpperCase())}</span><span>${esc(u.username)}</span>`;
+          li.onclick = () => { picked.set(u.username, true); renderChips(); e.target.value = ''; ul.innerHTML = ''; };
+          ul.appendChild(li);
+        }
+      } catch {}
+    }, 300);
+  });
+  $('ng-create').onclick = async () => {
+    const name = $('ng-name').value.trim();
+    if (!name) { alert('Give the group a name.'); return; }
+    try {
+      const data = await api('/api/groups', {
+        method: 'POST',
+        body: JSON.stringify({ name, members: [...picked.keys()] }),
+      });
+      closeNewGroupModal();
+      await loadGroups();
+      openGroup(data.groupId);
+    } catch (err) { alert(err.message); }
+  };
+  setTimeout(() => $('ng-name').focus(), 50);
 }
 
 // ---------------------------------------------------------------- reactions (web)
@@ -572,7 +886,7 @@ async function reactTo(m, emoji) {
     // session cookie authenticates the web UI (server falls back to it)
     const data = await api('/api/message/react', {
       method: 'POST',
-      body: JSON.stringify({ messageId: m.id, emoji, scope: 'dm' }),
+      body: JSON.stringify({ messageId: m.id, emoji, scope: msgScope() }),
     });
     m.reactions = data.reactions;
     renderMessages();
@@ -617,7 +931,7 @@ function startInlineEdit(m) {
     try {
       const data = await api('/api/message/edit', {
         method: 'POST',
-        body: JSON.stringify({ messageId: m.id, newText: text }),
+        body: JSON.stringify({ messageId: m.id, newText: text, scope: msgScope() }),
       });
       m.body = data.newText;
       m.edited = true;
@@ -664,7 +978,7 @@ async function doWebDelete(m, mode) {
   try {
     await api('/api/message/delete', {
       method: 'POST',
-      body: JSON.stringify({ messageId: m.id, mode, scope: 'dm' }),
+      body: JSON.stringify({ messageId: m.id, mode, scope: msgScope() }),
     });
     if (mode === 'everyone') {
       m.deleted = true;
@@ -676,6 +990,7 @@ async function doWebDelete(m, mode) {
     }
     renderMessages();
     loadChats();
+    loadGroups();
   } catch (err) {
     alert(err.message);
   }
@@ -822,10 +1137,10 @@ function sendVoiceNote(b64, mime, secs) {
   };
   state.active.messages.push(optimistic);
   renderMessages();
-  const payload = {
-    type: 'send', to: state.active.partnerId, kind: 'audio',
-    data: b64, mime, durationSec: secs, tempId,
-  };
+  // v7.1: group voice notes ride the group-message frame.
+  const payload = (state.active.kind === 'group')
+    ? { type: 'group-message', groupId: state.active.groupId, kind: 'audio', data: b64, mime, durationSec: secs, tempId }
+    : { type: 'send', to: state.active.partnerId, kind: 'audio', data: b64, mime, durationSec: secs, tempId };
   const ok = wsSend(payload);
   if (!ok) {
     state.active.messages = state.active.messages.filter((m) => m.tempId !== tempId);
@@ -861,15 +1176,24 @@ function wireMicButton() {
 let typingSent = false;
 let typingStopTimer = null;
 
+// v7.1: typing target depends on conversation kind.
+function typingPayload(typing) {
+  if (!state.active) return null;
+  if (state.active.kind === 'group') {
+    return { type: 'typing', groupId: state.active.groupId, typing };
+  }
+  return { type: 'typing', to: state.active.partnerId, typing };
+}
+
 $('input-message').addEventListener('input', () => {
   if (!state.active) return;
   if (!typingSent) {
-    wsSend({ type: 'typing', to: state.active.partnerId, typing: true });
+    wsSend(typingPayload(true));
     typingSent = true;
   }
   clearTimeout(typingStopTimer);
   typingStopTimer = setTimeout(() => {
-    if (state.active) wsSend({ type: 'typing', to: state.active.partnerId, typing: false });
+    if (state.active) wsSend(typingPayload(false));
     typingSent = false;
   }, 1500);
 });
@@ -890,9 +1214,15 @@ $('form-send').addEventListener('submit', (e) => {
   $('input-message').value = '';
   cancelReply();
   clearTimeout(typingStopTimer);
-  if (typingSent) { wsSend({ type: 'typing', to: state.active.partnerId, typing: false }); typingSent = false; }
+  if (typingSent) { wsSend(typingPayload(false)); typingSent = false; }
 
-  const payload = { type: 'send', to: state.active.partnerId, text, tempId };
+  // v7.1: group sends use the group-message frame.
+  let payload;
+  if (state.active.kind === 'group') {
+    payload = { type: 'group-message', groupId: state.active.groupId, text, tempId };
+  } else {
+    payload = { type: 'send', to: state.active.partnerId, text, tempId };
+  }
   if (replyTo) payload.replyTo = replyTo.id;
   const ok = wsSend(payload);
   if (!ok) {
@@ -929,6 +1259,7 @@ function handleWs(msg) {
         delete m.tempId;
         renderMessages();
         loadChats();
+        loadGroups(); // v7.1
       }
       break;
     }
@@ -969,6 +1300,7 @@ function handleWs(msg) {
         m.editedAt = msg.editedAt;
         renderMessages();
         loadChats();
+        loadGroups(); // v7.1
       }
       break;
     }
@@ -982,6 +1314,20 @@ function handleWs(msg) {
         m.data = null;
         renderMessages();
         loadChats();
+        loadGroups(); // v7.1
+      }
+      break;
+    }
+
+    case 'group-message': {
+      // v7.1: live group message
+      const m = msg.message;
+      const gid = String(msg.groupId || (m && m.groupId) || '');
+      const shown = appendGroupIncoming({ ...m, groupId: gid });
+      if (!shown) {
+        bumpGroupUnread(gid, { ...m, groupId: gid });
+      } else {
+        loadGroups();
       }
       break;
     }
@@ -997,6 +1343,24 @@ function handleWs(msg) {
     }
 
     case 'typing': {
+      // v7.1: group typing carries groupId + fromName.
+      if (msg.groupId) {
+        const gid = String(msg.groupId);
+        if (!state.groupTyping.has(gid)) state.groupTyping.set(gid, new Map());
+        const tm = state.groupTyping.get(gid);
+        const who = msg.fromName || 'Someone';
+        if (tm.has(who)) clearTimeout(tm.get(who));
+        if (msg.typing) {
+          tm.set(who, setTimeout(() => {
+            tm.delete(who);
+            refreshGroupHeader();
+          }, 4000));
+        } else {
+          tm.delete(who);
+        }
+        refreshGroupHeader();
+        break;
+      }
       if (state.typing.has(msg.from)) clearTimeout(state.typing.get(msg.from));
       if (msg.typing) {
         const t = setTimeout(() => {

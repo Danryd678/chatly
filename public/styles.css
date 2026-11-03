@@ -345,3 +345,45 @@ html, body {
   padding: 0 1px;
 }
 .msgsearch-time { font-size: 12px; color: #8a949e; white-space: nowrap; }
+
+/* ---- groups (v7.1) ---- */
+.sender-name {
+  font-size: 12px; font-weight: 700; margin-bottom: 2px;
+}
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 400;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.modal {
+  background: #fff; border-radius: 18px; padding: 20px;
+  width: 100%; max-width: 420px; max-height: 85vh; overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.modal-head h3 { margin: 0; font-size: 18px; }
+.modal h4 { margin: 14px 0 6px; font-size: 14px; color: #555; }
+.modal input {
+  width: 100%; padding: 10px 12px; margin: 6px 0;
+  border: 1px solid #dfe3e6; border-radius: 10px; font-size: 15px; box-sizing: border-box;
+}
+.modal .btn-primary { width: 100%; margin-top: 10px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #e7f6f3; color: #0b6e5f; border-radius: 999px;
+  padding: 4px 6px 4px 10px; font-size: 13px; font-weight: 600;
+}
+.chip button { border: none; background: none; cursor: pointer; font-size: 13px; color: #0b6e5f; }
+.gmember-list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+.gmember { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f0f2f4; }
+.gmember-name { flex: 1; font-weight: 600; font-size: 15px; }
+.link-btn { border: none; background: none; color: #d33; cursor: pointer; font-size: 13px; }
+.btn-small {
+  background: var(--teal); color: #fff; border: none; border-radius: 8px;
+  padding: 8px 14px; font-weight: 600; cursor: pointer; font-size: 14px; white-space: nowrap;
+}
+.modal .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+.modal .row .btn-danger { flex: 1; }
+.muted { color: #8a929a; font-size: 13px; margin: 4px 0; }
