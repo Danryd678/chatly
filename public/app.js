@@ -1387,6 +1387,264 @@ function handleWs(msg) {
   }
 }
 
+// ---------------------------------------------------------------- status / stories (v7.2)
+
+const STATUS_BGS = [
+  'linear-gradient(135deg,#2dd4bf,#8b5cf6)', 'linear-gradient(135deg,#8b5cf6,#ec4899)',
+  'linear-gradient(135deg,#0ea5e9,#8b5cf6)', 'linear-gradient(135deg,#2dd4bf,#0ea5e9)',
+  'linear-gradient(135deg,#6366f1,#8b5cf6)', 'linear-gradient(135deg,#111122,#2a2a40)',
+];
+let scBg = 0;
+const st = { groups: [], mine: [], viewedIds: new Set() };
+
+function ago(ts) {
+  const s = Math.max(1, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+
+$('btn-status').onclick = () => { show('view-status'); loadStatus(); };
+$('btn-back-status').onclick = () => show('view-chats');
+$('btn-addstatus').onclick = () => openStatusCreate();
+
+async function loadStatus() {
+  try {
+    const feed = await api('/api/status/feed');
+    const groups = feed.groups || buildGroups(feed.statuses || []);
+    st.viewedIds = new Set();
+    for (const g of groups) for (const id of (g.viewed || [])) st.viewedIds.add(String(id));
+    st.mine = [];
+    st.groups = [];
+    for (const g of groups) {
+      if (g.mine || (state.me && g.userId === state.me.id)) st.mine = g.items;
+      else st.groups.push(g);
+    }
+    renderStatus();
+  } catch (e) { /* keep old list on failure */ }
+}
+
+function buildGroups(statuses) {
+  const map = new Map();
+  for (const s of statuses) {
+    const key = s.userId;
+    if (!map.has(key)) map.set(key, { userId: s.userId, username: s.username, name: s.name, avatar: s.avatar, items: [], viewed: [], mine: false });
+    map.get(key).items.push(s);
+  }
+  return [...map.values()];
+}
+
+function statusViewed(id) { return st.viewedIds.has(String(id)); }
+
+function renderStatus() {
+  const mr = $('status-mine-row');
+  const nm = state.me ? state.me.username : '?';
+  mr.innerHTML = `
+    <div class="st-avatar mine" style="background:${avatarColor(nm)}">${esc(nm[0].toUpperCase())}<span class="st-plus">+</span></div>
+    <div class="st-meta"><b>My status</b><span>${st.mine.length ? st.mine.length + (st.mine.length === 1 ? ' update' : ' updates') : 'Disappears after 24 hours'}</span></div>`;
+  mr.onclick = () => {
+    if (st.mine.length) openStatusViewer(st.mine, 0, true);
+    else openStatusCreate();
+  };
+  const ul = $('status-list');
+  ul.innerHTML = '';
+  $('status-empty').hidden = st.groups.length > 0;
+  for (const g of st.groups) {
+    const unviewed = g.items.some((s) => !statusViewed(s.statusId));
+    const li = document.createElement('li');
+    li.className = 'st-row';
+    li.innerHTML = `
+      <div class="st-avatar${unviewed ? ' ring' : ''}" style="background:${avatarColor(g.username || '?')}">${esc((g.username || '?')[0].toUpperCase())}</div>
+      <div class="st-meta"><b>${esc(g.username || '?')}</b><span>${g.items.length > 1 ? g.items.length + ' updates · ' : ''}${ago(g.items[0].ts)}</span></div>`;
+    li.onclick = () => openStatusViewer(g.items, 0, false);
+    ul.appendChild(li);
+  }
+}
+
+// ---- viewer ----
+let sv = { items: [], index: 0, mine: false, timer: null, progress: 0, paused: false };
+
+function openStatusViewer(items, index, mine) {
+  sv = { items, index, mine, timer: null, progress: 0, paused: false };
+  $('status-viewer').hidden = false;
+  $('sv-viewerlist').hidden = true;
+  showStatusItem();
+}
+
+function closeStatusViewer() {
+  clearInterval(sv.timer);
+  $('status-viewer').hidden = true;
+}
+
+function showStatusItem() {
+  clearInterval(sv.timer);
+  sv.progress = 0;
+  const s = sv.items[sv.index];
+  if (!s) { closeStatusViewer(); return; }
+  const segs = $('sv-segments');
+  segs.innerHTML = '';
+  sv.items.forEach((_, i) => {
+    const d = document.createElement('div');
+    d.className = 'sv-seg' + (i < sv.index ? ' done' : '');
+    d.innerHTML = '<div class="sv-fill"></div>';
+    segs.appendChild(d);
+  });
+  $('sv-name').textContent = s.username || '?';
+  $('sv-time').textContent = ago(s.ts);
+  const body = $('sv-body');
+  body.innerHTML = '';
+  body.style.background = STATUS_BGS[Number(s.bg) || 0];
+  if (s.kind !== 'text' && s.data) {
+    const img = document.createElement('img');
+    img.src = 'data:image/jpeg;base64,' + s.data;
+    img.className = 'sv-img';
+    body.appendChild(img);
+  }
+  if (s.text) {
+    const t = document.createElement('div');
+    t.className = 'sv-text';
+    t.textContent = s.text;
+    body.appendChild(t);
+  }
+  const isMine = sv.mine;
+  $('sv-del').hidden = !isMine;
+  $('sv-viewers').hidden = !isMine;
+  if (isMine) loadViewerCount(s.statusId);
+  else api(`/api/status/${s.statusId}/view`, { method: 'POST' }).catch(() => {});
+  sv.timer = setInterval(() => {
+    if (sv.paused) return;
+    sv.progress += 2;
+    const fills = segs.querySelectorAll('.sv-seg .sv-fill');
+    if (fills[sv.index]) fills[sv.index].style.width = Math.min(100, sv.progress) + '%';
+    if (sv.progress >= 100) svNext();
+  }, 100);
+}
+
+function svNext() {
+  if (sv.index + 1 >= sv.items.length) { closeStatusViewer(); loadStatus(); return; }
+  sv.index++;
+  showStatusItem();
+}
+function svPrev() {
+  if (sv.index <= 0) { sv.progress = 0; return; }
+  sv.index--;
+  showStatusItem();
+}
+
+async function loadViewerCount(id) {
+  try {
+    const r = await api(`/api/status/${id}/views`);
+    $('sv-count').textContent = (r.views || []).length;
+  } catch { $('sv-count').textContent = '0'; }
+}
+
+$('sv-close').onclick = () => { closeStatusViewer(); loadStatus(); };
+let svDownAt = 0, svDownX = 0;
+$('sv-body').addEventListener('pointerdown', (e) => { sv.paused = true; svDownAt = Date.now(); svDownX = e.clientX; });
+$('sv-body').addEventListener('pointerup', (e) => {
+  sv.paused = false;
+  // Quick tap (not a hold): left third = previous, otherwise next.
+  if (Date.now() - svDownAt < 350) {
+    const r = $('sv-body').getBoundingClientRect();
+    if (e.clientX - r.left < r.width / 3) svPrev(); else svNext();
+  }
+});
+$('sv-body').addEventListener('pointercancel', () => { sv.paused = false; });
+
+$('sv-viewers').onclick = async (e) => {
+  e.stopPropagation();
+  const s = sv.items[sv.index];
+  const box = $('sv-viewerlist');
+  try {
+    const r = await api(`/api/status/${s.statusId}/views`);
+    const vs = r.views || [];
+    box.innerHTML = '<h4>Viewed by</h4>' + (vs.length
+      ? vs.map((v) => `<div class="sv-vrow"><b>${esc(v.name || v.username)}</b><span>${ago(v.viewedAt * 1000)}</span></div>`).join('')
+      : '<p class="muted">No views yet.</p>');
+  } catch { box.innerHTML = '<p class="muted">Could not load views.</p>'; }
+  box.hidden = !box.hidden;
+};
+
+$('sv-del').onclick = async (e) => {
+  e.stopPropagation();
+  const s = sv.items[sv.index];
+  if (!confirm('Delete this status?')) return;
+  try {
+    await api(`/api/status/${s.statusId}`, { method: 'DELETE' });
+    sv.items.splice(sv.index, 1);
+    if (!sv.items.length) { closeStatusViewer(); loadStatus(); return; }
+    if (sv.index >= sv.items.length) sv.index = sv.items.length - 1;
+    showStatusItem();
+    loadStatus();
+  } catch (err) { alert('Could not delete: ' + err.message); }
+};
+
+// ---- create ----
+function openStatusCreate() {
+  scBg = 0;
+  $('sc-text').value = '';
+  $('sc-file').value = '';
+  const bgs = $('sc-bgs');
+  bgs.innerHTML = '';
+  STATUS_BGS.forEach((g, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sc-bg' + (i === 0 ? ' sel' : '');
+    b.style.background = g;
+    b.onclick = () => { scBg = i; [...bgs.children].forEach((c, j) => c.classList.toggle('sel', j === i)); };
+    bgs.appendChild(b);
+  });
+  $('status-create').hidden = false;
+}
+$('sc-cancel').onclick = () => { $('status-create').hidden = true; };
+
+$('sc-post').onclick = async () => {
+  const btn = $('sc-post');
+  btn.disabled = true;
+  try {
+    const file = $('sc-file').files[0];
+    const text = $('sc-text').value.trim();
+    let kind = 'text', data = null;
+    if (file) {
+      data = await fileToStatusImage(file);
+      kind = 'image';
+    } else if (!text) {
+      alert('Type something or pick a photo.');
+      btn.disabled = false;
+      return;
+    }
+    await api('/api/status', { method: 'POST', body: JSON.stringify({ kind, text, data, bg: scBg }) });
+    $('status-create').hidden = true;
+    loadStatus();
+  } catch (err) { alert('Could not post: ' + err.message); }
+  btn.disabled = false;
+};
+
+function fileToStatusImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const max = 1280;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      let q = 0.85, out = c.toDataURL('image/jpeg', q);
+      while (out.length * 0.75 > 1024 * 1024 && q > 0.4) { q -= 0.15; out = c.toDataURL('image/jpeg', q); }
+      if (out.length * 0.75 > 1024 * 1024) return reject(new Error('Photo is too large (1 MB max).'));
+      resolve(out.split(',')[1]);
+    };
+    img.onerror = () => reject(new Error('Could not read that photo.'));
+    img.src = url;
+  });
+}
+
 // ---------------------------------------------------------------- profile / nav
 
 $('btn-back').onclick = () => { state.active = null; show('view-chats'); loadChats(); };

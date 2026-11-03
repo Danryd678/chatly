@@ -40,6 +40,7 @@
       <header class="topbar">
         <span class="logo small">Chatly</span>
         <div class="topbar-actions">
+          <button id="btn-status" class="icon-btn" title="Status" aria-label="Status">◉</button>
           <button id="btn-msgsearch" class="icon-btn" title="Search messages" aria-label="Search messages">🔍</button>
           <button id="btn-newchat" class="icon-btn" title="New chat" aria-label="New chat">＋</button>
           <button id="btn-newgroup" class="icon-btn" title="New group" aria-label="New group">👥</button>
@@ -81,6 +82,48 @@
         <button type="submit" class="btn-send" aria-label="Send">➤</button>
       </form>
     </section>
+
+    <!-- Status view -->
+    <section id="view-status" class="view" hidden>
+      <header class="topbar">
+        <button id="btn-back-status" class="icon-btn" aria-label="Back">←</button>
+        <span class="logo small">Status</span>
+        <div class="topbar-actions">
+          <button id="btn-addstatus" class="icon-btn" title="New status" aria-label="New status">＋</button>
+        </div>
+      </header>
+      <div id="status-mine-row" class="status-mine"></div>
+      <h3 class="status-h">Recent updates</h3>
+      <ul id="status-list" class="status-list"></ul>
+      <p id="status-empty" class="empty" hidden>No recent updates yet.</p>
+      <div id="status-create" class="status-create" hidden>
+        <div class="sc-card">
+          <h3>New status</h3>
+          <div class="sc-bgs" id="sc-bgs"></div>
+          <textarea id="sc-text" rows="3" maxlength="500" placeholder="Type something…"></textarea>
+          <label class="sc-photo">📷 Photo <input id="sc-file" type="file" accept="image/*" hidden /></label>
+          <div class="sc-actions">
+            <button id="sc-cancel" class="btn-ghost">Cancel</button>
+            <button id="sc-post" class="btn-primary">Post</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Full-screen status viewer -->
+    <div id="status-viewer" class="status-viewer" hidden>
+      <div class="sv-segments" id="sv-segments"></div>
+      <div class="sv-head">
+        <button id="sv-close" class="icon-btn">✕</button>
+        <div class="sv-who"><div id="sv-name"></div><div id="sv-time"></div></div>
+      </div>
+      <div class="sv-body" id="sv-body"></div>
+      <div class="sv-foot">
+        <button id="sv-viewers" class="sv-pill" hidden>👁 <span id="sv-count">0</span></button>
+        <button id="sv-del" class="sv-pill" hidden>🗑 Delete</button>
+      </div>
+      <div id="sv-viewerlist" class="sv-viewerlist" hidden></div>
+    </div>
 
     <!-- Profile view -->
     <section id="view-profile" class="view" hidden>
