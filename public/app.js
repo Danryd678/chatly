@@ -233,6 +233,89 @@ $('input-search').addEventListener('input', () => {
   }, 250);
 });
 
+// ---------------------------------------------------------------- v6.9: in-app message search
+
+$('btn-msgsearch').onclick = () => {
+  const panel = $('msgsearch-panel');
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) $('input-msgsearch').focus();
+};
+
+let msgSearchTimer = null;
+$('input-msgsearch').addEventListener('input', () => {
+  clearTimeout(msgSearchTimer);
+  msgSearchTimer = setTimeout(runMsgSearch, 300);
+});
+
+function highlightMatch(raw, idx, len) {
+  if (idx == null || idx < 0 || !len) return esc(String(raw || ''));
+  const s = String(raw || '');
+  return esc(s.slice(0, idx)) + '<mark>' + esc(s.slice(idx, idx + len)) + '</mark>' + esc(s.slice(idx + len));
+}
+
+async function runMsgSearch() {
+  const q = $('input-msgsearch').value.trim();
+  const ul = $('msgsearch-results');
+  ul.innerHTML = '';
+  if (q.length < 2) {
+    if (q) ul.innerHTML = '<li class="empty">Type at least 2 characters.</li>';
+    return;
+  }
+  ul.innerHTML = '<li class="empty">Searching…</li>';
+  try {
+    const data = await api('/api/search?q=' + encodeURIComponent(q));
+    ul.innerHTML = '';
+    if (!data.results || !data.results.length) {
+      ul.innerHTML = '<li class="empty">No messages found.</li>';
+      return;
+    }
+    let lastPartner = null;
+    for (const r of data.results) {
+      if (r.partner !== lastPartner) {
+        lastPartner = r.partner;
+        const h = document.createElement('li');
+        h.className = 'msgsearch-group';
+        h.textContent = r.partner;
+        ul.appendChild(h);
+      }
+      const li = document.createElement('li');
+      li.className = 'msgsearch-row';
+      const kindTag = r.kind === 'audio' ? '🎤 ' : '';
+      li.innerHTML = `<span class="msgsearch-snippet">${kindTag}${highlightMatch(r.snippet, r.matchIndex, r.matchLength)}</span>` +
+        `<span class="msgsearch-time">${fmtTime(r.createdAt)}</span>`;
+      li.onclick = () => {
+        $('msgsearch-panel').hidden = true;
+        openChatAndJump(r.partnerId, r.partner, r.id);
+      };
+      ul.appendChild(li);
+    }
+  } catch {
+    ul.innerHTML = '<li class="empty">Search failed — try again.</li>';
+  }
+}
+
+// Open a chat and scroll to a specific message, paging older history if needed.
+async function openChatAndJump(partnerId, username, messageId) {
+  await openChat(partnerId, username);
+  let guard = 0;
+  while (guard++ < 20 && state.active) {
+    if (document.querySelector(`.bubble[data-id="${messageId}"]`)) break;
+    const msgs = state.active.messages;
+    if (!msgs.length) break;
+    let more, hasMore = false;
+    try {
+      const data = await api('/api/messages/' + partnerId + '?before=' + msgs[0].id + '&limit=50');
+      more = data.messages || [];
+      hasMore = !!data.hasMore;
+    } catch { break; }
+    if (!more.length) break;
+    state.active.messages = more.concat(msgs);
+    renderMessages();
+    if (!hasMore) break;
+  }
+  jumpToMessage(messageId);
+}
+
 // ---------------------------------------------------------------- conversation
 
 function convoStatusText(partnerId) {

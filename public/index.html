@@ -40,10 +40,15 @@
       <header class="topbar">
         <span class="logo small">Chatly</span>
         <div class="topbar-actions">
+          <button id="btn-msgsearch" class="icon-btn" title="Search messages" aria-label="Search messages">🔍</button>
           <button id="btn-newchat" class="icon-btn" title="New chat" aria-label="New chat">＋</button>
           <button id="btn-profile" class="icon-btn" title="Profile" aria-label="Profile">⚙</button>
         </div>
       </header>
+      <div id="msgsearch-panel" hidden>
+        <input id="input-msgsearch" type="search" placeholder="Search your messages…" />
+        <ul id="msgsearch-results" class="msgsearch-list"></ul>
+      </div>
       <div id="newchat-panel" hidden>
         <input id="input-search" type="search" placeholder="Search users by username…" />
         <ul id="search-results" class="user-list"></ul>
@@ -63,6 +68,7 @@
           <span id="convo-name"></span>
           <span id="convo-status" class="convo-status"></span>
         </div>
+        <button id="btn-export" class="icon-btn" title="Export chat" aria-label="Export chat">⤴️</button>
       </header>
       <div id="conn-banner-convo" class="conn-banner" hidden>Reconnecting…</div>
       <div id="messages" class="messages"></div>
