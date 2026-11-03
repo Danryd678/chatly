@@ -305,6 +305,9 @@ await ensureColumn('messages', 'deleted_at', 'INTEGER'); // epoch ms of delete-f
 // --- v6.7 migrations: message replies/quotes -----------------------------------
 await ensureColumn('messages', 'reply_to', 'INTEGER'); // id of the quoted DM; NULL = not a reply
 
+// --- v6.8 migrations: voice note duration --------------------------------------
+await ensureColumn('messages', 'duration_sec', 'INTEGER'); // voice note length in seconds; NULL = n/a
+
 // --- v4.1 migrations: group/channel edit, invites, avatar -------------------
   await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn('groups', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
@@ -777,9 +780,12 @@ function logMailError(where, err) {
 
 // ---------------------------------------------------------------- messages
 
-async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false, replyTo = null }) {
+async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false, replyTo = null, durationSec = null }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
+  // v6.8: voice note duration, sanity-clamped.
+  let dur = null;
+  if (kind === 'audio' && Number.isInteger(durationSec)) dur = Math.max(1, Math.min(durationSec, 3600));
   // v6.7: validate replyTo — must be an existing DM in this same conversation.
   let replyToId = null;
   if (replyTo != null) {
@@ -793,8 +799,8 @@ async function insertMessage(senderId, recipientId, { kind = 'text', body = '', 
     }
   }
   const info = await dbRun(
-    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at, view_once, reply_to) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt, viewOnce ? 1 : 0, replyToId]
+    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at, view_once, reply_to, duration_sec) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt, viewOnce ? 1 : 0, replyToId, dur]
   );
   return (await dbGet('SELECT * FROM messages WHERE id = ?', [info.lastInsertRowid]));
 }
@@ -854,9 +860,11 @@ function toClientMessage(m) {
     editedAt: m.edited_at || null,
     deleted: !!m.deleted,
     deletedAt: m.deleted_at || null,
+    durationSec: m.duration_sec != null ? Number(m.duration_sec) : null, // v6.8: voice note length
     viewOnce,
     viewed,
   };
+  if (m.deleted) o.data = null; // v6.8: delete-for-everyone wipes media bytes too
   if (viewOnce && viewed) delete o.data; // placeholder only — the media is gone for good
   return o;
 }
@@ -2222,6 +2230,75 @@ app.post('/api/message/edit', rateLimit('editmsg', 60), ah(async (req, res) => {
   res.json({ ok: true, messageId: msgId, newText, edited: true, editedAt: now });
 }));
 
+// POST /api/message/voice {to, audioBase64, mime?, durationSec} — send a voice
+// note as a DM (v6.8). Same result as WS {type:'send', kind:'audio'} but usable
+// over plain HTTP. DMs only. Audio capped at 1MB decoded (matches MAX_MEDIA_BYTES);
+// duration validated 1–600s (clients cap recording at 120s).
+app.post('/api/message/voice', rateLimit('voicemsg', 30), ah(async (req, res) => {
+  // Web UI: HttpOnly session cookie. API/Android: token via body/query/Bearer.
+  const user = (await getUserFromReq(req)) || (await getApiUser(req));
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const partner = await resolveRecipient(req.body && req.body.to);
+  if (!partner || partner.id === user.id) {
+    return res.status(400).json({ error: 'bad_request', message: 'Valid recipient required.' });
+  }
+  const b64 = typeof (req.body && req.body.audioBase64) === 'string' ? req.body.audioBase64 : '';
+  const bytes = base64ByteLength(b64);
+  if (bytes < 1 || bytes > MAX_MEDIA_BYTES) {
+    return res.status(413).json({ error: 'too_large', message: 'Voice note must be 1 byte – 1 MB.' });
+  }
+  const durationSec = Number(req.body && req.body.durationSec);
+  if (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > 600) {
+    return res.status(400).json({ error: 'bad_request', message: 'durationSec must be 1–600.' });
+  }
+  const mime = typeof (req.body && req.body.mime) === 'string'
+    ? String(req.body.mime).slice(0, 100) : 'audio/mp4';
+  const m = await insertMessage(user.id, partner.id, {
+    kind: 'audio', body: '', data: b64, mime, durationSec,
+  });
+  // Deliver live like the WS send path; persist regardless of blocks.
+  const blocked = await isBlocked(partner.id, user.id);
+  let delivered = false;
+  if (!blocked) {
+    delivered = sendToUser(partner.id, {
+      type: 'message',
+      from: user.id,
+      fromName: user.username,
+      sender: user.username,
+      message: { ...await toClientMessageFull(m), from: user.id, sender: user.username },
+    });
+  }
+  if (delivered) {
+    (await dbRun('UPDATE messages SET status = 1 WHERE id = ?', [m.id]));
+    m.status = 1;
+  }
+  res.json({ ok: true, message: await toClientMessageFull(m) });
+}));
+
+// GET /api/message/:id/audio — fetch a voice note's bytes (v6.8).
+// Participant-only: 403 for outsiders, 404 for missing/non-audio messages.
+app.get('/api/message/:id/audio', ah(async (req, res) => {
+  const user = (await getUserFromReq(req)) || (await getApiUser(req));
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const msgId = Number(req.params.id);
+  if (!Number.isInteger(msgId) || msgId <= 0) {
+    return res.status(400).json({ error: 'bad_request', message: 'Message id required.' });
+  }
+  const m = await dbGet('SELECT * FROM messages WHERE id = ?', [msgId]);
+  if (!m || m.kind !== 'audio' || m.deleted) {
+    return res.status(404).json({ error: 'not_found', message: 'Voice note not found.' });
+  }
+  if (m.sender_id !== user.id && m.recipient_id !== user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
+  }
+  res.json({
+    ok: true,
+    mime: m.mime || 'audio/mp4',
+    durationSec: m.duration_sec != null ? Number(m.duration_sec) : null,
+    data: m.data,
+  });
+}));
+
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,
 // expired messages excluded, messages from blocked senders hidden.
 app.get('/api/groups/:id/history', ah(async (req, res) => {
@@ -2863,7 +2940,7 @@ app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
         return res.status(410).json({ error: 'expired', message: 'Delete-for-everyone window (48h) has expired.' });
       }
       await dbRun(
-        'UPDATE messages SET body = ?, deleted = 1, deleted_at = ?, reactions = ? WHERE id = ?',
+        'UPDATE messages SET body = ?, deleted = 1, deleted_at = ?, reactions = ?, data = NULL WHERE id = ?',
         [DELETED_PLACEHOLDER, Date.now(), '{}', messageId]
       );
       const otherId = m.sender_id === userId ? m.recipient_id : m.sender_id;
@@ -3204,6 +3281,8 @@ wss.on('connection', async (ws, req) => {
       if (!content) return;
       // v6.7: replies — pass through; insertMessage validates the quoted message.
       if (msg.replyTo != null) content.replyTo = msg.replyTo;
+      // v6.8: voice note duration passthrough (clamped inside insertMessage).
+      if (content.kind === 'audio' && Number.isInteger(msg.durationSec)) content.durationSec = msg.durationSec;
 
       // Persist always; deliver only if the recipient hasn't blocked us.
       let m;
