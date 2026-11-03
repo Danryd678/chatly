@@ -2299,6 +2299,61 @@ app.get('/api/message/:id/audio', ah(async (req, res) => {
   });
 }));
 
+// GET /api/search?q=...&token= — in-app DM search (v6.9). DMs only.
+// Case-insensitive LIKE on body, newest first, cap 50. Excludes messages the
+// user deleted-for-me; deleted-for-everyone messages show only the placeholder.
+app.get('/api/search', rateLimit('search', 60), ah(async (req, res) => {
+  const user = (await getUserFromReq(req)) || (await getApiUser(req));
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) {
+    return res.status(400).json({ error: 'bad_query', message: 'Search needs at least 2 characters.' });
+  }
+  if (q.length > 100) {
+    return res.status(400).json({ error: 'bad_query', message: 'Query too long.' });
+  }
+  const now = Date.now();
+  const live = '(m.expire_at IS NULL OR m.expire_at > ?)';
+  const notHidden = `AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = m.id AND dm.scope = 'dm')`;
+  const rows = await dbAll(`
+    SELECT m.*, s.username AS sender_username, r.username AS recipient_username
+    FROM messages m
+    JOIN users s ON s.id = m.sender_id
+    JOIN users r ON r.id = m.recipient_id
+    WHERE (m.sender_id = ? OR m.recipient_id = ?)
+      AND m.body LIKE ? ESCAPE '\\'
+      AND ${live} ${notHidden}
+    ORDER BY m.id DESC LIMIT 50
+  `, [user.id, user.id, '%' + q.replace(/[\\%_]/g, '\\$&') + '%', now, user.id]);
+  const qLower = q.toLowerCase();
+  const results = rows.map((m) => {
+    const o = toClientMessage(m);
+    o.partner = m.sender_id === user.id ? m.recipient_username : m.sender_username;
+    o.partnerId = m.sender_id === user.id ? m.recipient_id : m.sender_id;
+    if (m.deleted) {
+      o.snippet = '🚫 This message was deleted';
+      o.matchIndex = -1;
+      o.matchLength = 0;
+    } else {
+      const body = String(m.body || '');
+      if (o.kind === 'audio' && !body) {
+        o.snippet = '🎤 Voice note' + (o.durationSec != null ? ` (${o.durationSec}s)` : '');
+        o.matchIndex = -1;
+        o.matchLength = 0;
+      } else {
+        const idx = body.toLowerCase().indexOf(qLower);
+        const start = Math.max(0, idx - 40);
+        const end = Math.min(body.length, idx + q.length + 40);
+        o.snippet = (start > 0 ? '…' : '') + body.slice(start, end) + (end < body.length ? '…' : '');
+        o.matchIndex = idx - start;
+        o.matchLength = q.length;
+      }
+    }
+    return o;
+  });
+  res.json({ ok: true, results });
+}));
+
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,
 // expired messages excluded, messages from blocked senders hidden.
 app.get('/api/groups/:id/history', ah(async (req, res) => {
