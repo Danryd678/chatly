@@ -14,6 +14,7 @@ const state = {
   typing: new Map(),    // userId -> timeout id for "typing" indicator
   tempSeq: 0,
   authMode: 'login',
+  replyTo: null,        // v6.7: { id, sender, snippet } — message being replied to
 };
 
 // ---------------------------------------------------------------- helpers
@@ -283,9 +284,11 @@ function renderMessages() {
     if (m.deleted) {
       b.innerHTML = `<span class="deleted-text">🚫 This message was deleted</span><span class="meta">${fmtTime(m.createdAt)}${ticks}</span>`;
     } else {
-      b.innerHTML = `${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+      b.innerHTML = `${replyQuoteHtml(m)}${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
     }
     wireBubbleReactions(b, m);
+    const qb = b.querySelector('.quote-block');
+    if (qb) qb.addEventListener('click', (ev) => { ev.stopPropagation(); jumpToMessage(qb.dataset.quote); });
     box.appendChild(b);
   }
   box.scrollTop = box.scrollHeight;
@@ -384,6 +387,12 @@ function showReactPicker(m, b) {
   db.textContent = '🗑️ Delete message';
   db.onclick = (ev) => { ev.stopPropagation(); hideReactPicker(); deleteMessageDialog(m); };
   pk.appendChild(db);
+  const rp = document.createElement('button');
+  rp.type = 'button';
+  rp.className = 'picker-reply';
+  rp.textContent = '↩️ Reply';
+  rp.onclick = (ev) => { ev.stopPropagation(); hideReactPicker(); startReply(m); };
+  pk.appendChild(rp);
   document.body.appendChild(pk);
   const r = b.getBoundingClientRect();
   pk.style.left = Math.max(8, Math.min(window.innerWidth - pk.offsetWidth - 8, r.left)) + 'px';
@@ -396,6 +405,73 @@ function showReactPicker(m, b) {
 function hideReactPicker() {
   const pk = document.getElementById('react-picker');
   if (pk) pk.remove();
+}
+
+// ---------------------------------------------------------------- replies (web, v6.7)
+
+function replyInfoOf(m) {
+  if (!m) return null;
+  if (m.replyTo && m.replyTo.messageId) {
+    return { id: m.replyTo.messageId, sender: m.replyTo.sender || 'user', snippet: m.replyTo.snippet || '' };
+  }
+  const mine = m.senderId === (state.me && state.me.id);
+  return { id: m.id, sender: mine ? 'You' : (m.sender || 'user'), snippet: String(m.body || '').slice(0, 80) };
+}
+
+function ensureReplyBar() {
+  let bar = document.getElementById('reply-bar');
+  if (bar) return bar;
+  const form = document.getElementById('form-send');
+  bar = document.createElement('div');
+  bar.id = 'reply-bar';
+  bar.hidden = true;
+  form.parentNode.insertBefore(bar, form);
+  return bar;
+}
+
+function startReply(m) {
+  const info = replyInfoOf(m);
+  if (!info || !info.id) return;
+  state.replyTo = info;
+  const bar = ensureReplyBar();
+  bar.hidden = false;
+  bar.innerHTML = '';
+  const q = document.createElement('div');
+  q.className = 'reply-quote';
+  const nm = document.createElement('div');
+  nm.className = 'reply-quote-name';
+  nm.textContent = info.sender;
+  const sn = document.createElement('div');
+  sn.className = 'reply-quote-snippet';
+  sn.textContent = info.snippet || '(message)';
+  q.appendChild(nm); q.appendChild(sn);
+  const x = document.createElement('button');
+  x.type = 'button'; x.className = 'reply-cancel'; x.textContent = '✕';
+  x.onclick = cancelReply;
+  bar.appendChild(q); bar.appendChild(x);
+  document.getElementById('input-message').focus();
+}
+
+function cancelReply() {
+  state.replyTo = null;
+  const bar = document.getElementById('reply-bar');
+  if (bar) { bar.hidden = true; bar.innerHTML = ''; }
+}
+
+function replyQuoteHtml(m) {
+  const r = m.replyTo;
+  if (!r || !r.messageId) return '';
+  const nm = esc(r.sender || 'user');
+  const sn = esc(r.snippet || '(message)');
+  return `<div class="quote-block" data-quote="${r.messageId}"><div class="quote-name">${nm}</div><div class="quote-snippet">${sn}</div></div>`;
+}
+
+function jumpToMessage(id) {
+  const el = document.querySelector(`.bubble[data-id="${id}"]`);
+  if (!el) return;
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.classList.add('quote-flash');
+  setTimeout(() => el.classList.remove('quote-flash'), 1200);
 }
 
 async function reactTo(m, emoji) {
@@ -535,17 +611,22 @@ $('form-send').addEventListener('submit', (e) => {
   const text = $('input-message').value.trim();
   if (!text || !state.active) return;
   const tempId = 't' + (++state.tempSeq);
+  const replyTo = state.replyTo; // v6.7: may be null
   const optimistic = {
     id: null, tempId, senderId: state.me.id, body: text, status: 0,
     createdAt: Date.now(),
   };
+  if (replyTo) optimistic.replyTo = { messageId: replyTo.id, sender: replyTo.sender, snippet: replyTo.snippet, deleted: false };
   state.active.messages.push(optimistic);
   renderMessages();
   $('input-message').value = '';
+  cancelReply();
   clearTimeout(typingStopTimer);
   if (typingSent) { wsSend({ type: 'typing', to: state.active.partnerId, typing: false }); typingSent = false; }
 
-  const ok = wsSend({ type: 'send', to: state.active.partnerId, text, tempId });
+  const payload = { type: 'send', to: state.active.partnerId, text, tempId };
+  if (replyTo) payload.replyTo = replyTo.id;
+  const ok = wsSend(payload);
   if (!ok) {
     // dropped; remove optimistic message and complain gently
     state.active.messages = state.active.messages.filter((m) => m.tempId !== tempId);
@@ -633,6 +714,16 @@ function handleWs(msg) {
         m.data = null;
         renderMessages();
         loadChats();
+      }
+      break;
+    }
+
+    case 'error': {
+      if (msg.error === 'bad_reply_to' && state.active) {
+        // v6.7: server rejected our reply — drop the optimistic bubble.
+        state.active.messages = state.active.messages.filter((x) => x.tempId !== msg.tempId);
+        renderMessages();
+        alert("Couldn't send reply — the quoted message is gone.");
       }
       break;
     }

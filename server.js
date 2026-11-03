@@ -302,6 +302,9 @@ async function initDb() {
 // --- v4.3 migrations: delete-for-everyone timestamp ----------------------------
 await ensureColumn('messages', 'deleted_at', 'INTEGER'); // epoch ms of delete-for-everyone
 
+// --- v6.7 migrations: message replies/quotes -----------------------------------
+await ensureColumn('messages', 'reply_to', 'INTEGER'); // id of the quoted DM; NULL = not a reply
+
 // --- v4.1 migrations: group/channel edit, invites, avatar -------------------
   await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
   await ensureColumn('groups', 'avatar', 'TEXT'); // base64 data URL (<= 500KB)
@@ -774,14 +777,52 @@ function logMailError(where, err) {
 
 // ---------------------------------------------------------------- messages
 
-async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false }) {
+async function insertMessage(senderId, recipientId, { kind = 'text', body = '', data = null, mime = null, ttl = null, viewOnce = false, replyTo = null }) {
   const now = Date.now();
   const expireAt = ttl ? now + ttl * 1000 : null;
+  // v6.7: validate replyTo — must be an existing DM in this same conversation.
+  let replyToId = null;
+  if (replyTo != null) {
+    const rid = Number(replyTo);
+    if (Number.isInteger(rid) && rid > 0) {
+      const q = await dbGet('SELECT id FROM messages WHERE id = ? AND ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))', [rid, senderId, recipientId, recipientId, senderId]);
+      if (q) replyToId = rid;
+      else throw Object.assign(new Error('bad_reply_to'), { code: 'bad_reply_to' });
+    } else {
+      throw Object.assign(new Error('bad_reply_to'), { code: 'bad_reply_to' });
+    }
+  }
   const info = await dbRun(
-    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at, view_once) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)',
-    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt, viewOnce ? 1 : 0]
+    'INSERT INTO messages (sender_id, recipient_id, body, status, created_at, kind, data, mime, ttl, expire_at, view_once, reply_to) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [senderId, recipientId, body, now, kind, data, mime, ttl, expireAt, viewOnce ? 1 : 0, replyToId]
   );
   return (await dbGet('SELECT * FROM messages WHERE id = ?', [info.lastInsertRowid]));
+}
+
+// v6.7: build the replyTo payload for a message: {messageId, sender, snippet, deleted}.
+// Returns null when the message is not a reply. If the quoted message was
+// deleted-for-everyone, its body is already the 🚫 placeholder — never the original.
+async function enrichReply(m) {
+  const rid = m.reply_to != null ? Number(m.reply_to) : null;
+  if (!Number.isInteger(rid) || rid <= 0) return null;
+  const q = await dbGet('SELECT id, sender_id, body, deleted FROM messages WHERE id = ?', [rid]);
+  if (!q) return null;
+  const sender = await getUserById(q.sender_id);
+  const body = typeof q.body === 'string' ? q.body : '';
+  return {
+    messageId: q.id,
+    sender: sender ? sender.username : 'user',
+    snippet: body.slice(0, 80),
+    deleted: !!q.deleted,
+  };
+}
+
+// Same as toClientMessage but with the replyTo quote attached (async: needs a lookup).
+async function toClientMessageFull(m) {
+  const o = toClientMessage(m);
+  const r = await enrichReply(m);
+  if (r) o.replyTo = r;
+  return o;
 }
 
 function parseReactions(json) {
@@ -2740,7 +2781,7 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
 
   res.json({
     partner,
-    messages: rows.map(toClientMessage),
+    messages: await Promise.all(rows.map((r) => toClientMessageFull(r))),
     hasMore: before ? rows.length === limit : false,
   });
 }));
@@ -3124,7 +3165,7 @@ wss.on('connection', async (ws, req) => {
           from: m.sender_id,
           fromName: senderName,
           sender: senderName,
-          message: { ...toClientMessage(m), from: m.sender_id, sender: senderName },
+          message: { ...await toClientMessageFull(m), from: m.sender_id, sender: senderName },
         });
       }
       (await dbRun('UPDATE messages SET status = 1 WHERE recipient_id = ? AND status = 0', [userId]));
@@ -3150,7 +3191,7 @@ wss.on('connection', async (ws, req) => {
         return;
       }
 
-    // ---- 1:1 send (text | image | audio | location, optional ttl) ---------
+    // ---- 1:1 send (text | image | audio | location, optional ttl, optional replyTo)
     if (msg.type === 'send') {
       const partner = await resolveRecipient(msg.to);
       if (!partner || partner.id === userId) return;
@@ -3161,9 +3202,20 @@ wss.on('connection', async (ws, req) => {
         return;
       }
       if (!content) return;
+      // v6.7: replies — pass through; insertMessage validates the quoted message.
+      if (msg.replyTo != null) content.replyTo = msg.replyTo;
 
       // Persist always; deliver only if the recipient hasn't blocked us.
-      const m = await insertMessage(userId, partner.id, content);
+      let m;
+      try {
+        m = await insertMessage(userId, partner.id, content);
+      } catch (e) {
+        if (e && e.code === 'bad_reply_to') {
+          ws.send(JSON.stringify({ type: 'error', error: 'bad_reply_to', tempId: msg.tempId || null }));
+          return;
+        }
+        throw e;
+      }
       const blocked = await isBlocked(partner.id, userId);
       let delivered = false;
       if (!blocked) {
@@ -3172,14 +3224,14 @@ wss.on('connection', async (ws, req) => {
           from: userId,
           fromName: user.username,
           sender: user.username,
-          message: { ...toClientMessage(m), from: userId, sender: user.username },
+          message: { ...await toClientMessageFull(m), from: userId, sender: user.username },
         });
       }
       if (delivered) {
         (await dbRun('UPDATE messages SET status = 1 WHERE id = ?', [m.id]));
         m.status = 1;
       }
-      ws.send(JSON.stringify({ type: 'sent', tempId: msg.tempId || null, message: toClientMessage(m) }));
+      ws.send(JSON.stringify({ type: 'sent', tempId: msg.tempId || null, message: await toClientMessageFull(m) }));
       return;
     }
 
