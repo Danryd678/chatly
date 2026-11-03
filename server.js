@@ -2354,6 +2354,80 @@ app.get('/api/search', rateLimit('search', 60), ah(async (req, res) => {
   res.json({ ok: true, results });
 }));
 
+// GET /api/export/chat/:partnerId?format=text|json — full DM history export (v7.0).
+// Participant-only; cap 10,000 messages; expired messages excluded; delete-for-me
+// hidden messages excluded for the requester.
+app.get('/api/export/chat/:partnerId', rateLimit('export', 20), ah(async (req, res) => {
+  const user = (await getUserFromReq(req)) || (await getApiUser(req));
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  const partner = await getUserById(Number(req.params.partnerId));
+  if (!partner) return res.status(404).json({ error: 'not_found', message: 'User not found.' });
+  const format = String(req.query.format || 'text').toLowerCase();
+  if (format !== 'text' && format !== 'json') {
+    return res.status(400).json({ error: 'bad_format', message: "format must be 'text' or 'json'." });
+  }
+  const now = Date.now();
+  const rows = await dbAll(`
+    SELECT m.*, s.username AS sender_username
+    FROM messages m
+    JOIN users s ON s.id = m.sender_id
+    WHERE ((m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?))
+      AND (m.expire_at IS NULL OR m.expire_at > ?)
+      AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = m.id AND dm.scope = 'dm')
+    ORDER BY m.id ASC LIMIT 10000
+  `, [user.id, partner.id, partner.id, user.id, now, user.id]);
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtWat = (ts) => { // WAT = UTC+1, no DST
+    const d = new Date(Number(ts) + 3600000);
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  };
+  const fmtDur = (s) => { s = Math.max(0, Math.round(Number(s) || 0)); return `${Math.floor(s / 60)}:${pad(s % 60)}`; };
+  const reactStr = (m) => {
+    const r = parseReactions(m.reactions);
+    const parts = [];
+    for (const [emoji, users] of Object.entries(r)) {
+      if (Array.isArray(users) && users.length) parts.push(`${emoji} from ${users.join(', ')}`);
+    }
+    return parts.join('; ');
+  };
+  const safeName = String(partner.username).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 40) || 'chat';
+
+  if (format === 'json') {
+    const arr = rows.map((m) => ({
+      id: m.id,
+      sender: m.sender_username || '',
+      kind: m.kind || 'text',
+      body: m.deleted ? null : (m.body || ''),
+      createdAt: m.created_at,
+      edited: !!m.edited,
+      editedAt: m.edited_at || null,
+      deleted: !!m.deleted,
+      durationSec: m.duration_sec != null ? Number(m.duration_sec) : null,
+      reactions: parseReactions(m.reactions),
+    }));
+    res.set('Content-Type', 'application/json; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="chat-with-${safeName}.json"`);
+    return res.send(JSON.stringify(arr, null, 2));
+  }
+
+  const lines = [`Chat with ${partner.username}`, `Exported ${fmtWat(now)} (WAT)`, ''];
+  for (const m of rows) {
+    const sender = m.sender_username || '?';
+    let text;
+    if (m.deleted) text = '[deleted]';
+    else if (m.kind === 'audio' || m.kind === 'voice') text = `[voice note ${fmtDur(m.duration_sec)}]`;
+    else text = m.body || '';
+    if (!m.deleted && m.edited) text += ' (edited)';
+    const rx = !m.deleted && reactStr(m);
+    if (rx) text += ` (${rx})`;
+    lines.push(`[${fmtWat(m.created_at)}] ${sender}: ${text}`);
+  }
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="chat-with-${safeName}.txt"`);
+  res.send(lines.join('\n'));
+}));
+
 // GET /api/groups/:id/history?token=&limit=50 — newest `limit`, oldest→newest,
 // expired messages excluded, messages from blocked senders hidden.
 app.get('/api/groups/:id/history', ah(async (req, res) => {
