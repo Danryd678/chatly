@@ -274,13 +274,17 @@ function renderMessages() {
     }
     const mine = m.senderId === state.me.id;
     const b = document.createElement('div');
-    b.className = 'bubble ' + (mine ? 'mine' : 'theirs');
+    b.className = 'bubble ' + (mine ? 'mine' : 'theirs') + (m.deleted ? ' deleted' : '');
     b.dataset.id = m.id;
     const ticks = mine
       ? `<span class="ticks${m.status === 2 ? ' read' : ''}" data-ticks>${m.status === 0 ? '✓' : '✓✓'}</span>`
       : '';
     const editedTag = m.edited ? '<span class="edited-tag">edited</span>' : '';
-    b.innerHTML = `${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+    if (m.deleted) {
+      b.innerHTML = `<span class="deleted-text">🚫 This message was deleted</span><span class="meta">${fmtTime(m.createdAt)}${ticks}</span>`;
+    } else {
+      b.innerHTML = `${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
+    }
     wireBubbleReactions(b, m);
     box.appendChild(b);
   }
@@ -330,6 +334,7 @@ function reactionPillsHtml(m) {
 
 function wireBubbleReactions(b, m) {
   if (!m || !m.id) return; // optimistic temp message — no id yet
+  if (m.deleted) return; // deleted messages have no actions
   b.addEventListener('click', (ev) => {
     if (b.classList.contains('editing')) return;
     const pill = ev.target.closest('.rpill');
@@ -373,6 +378,12 @@ function showReactPicker(m, b) {
     eb.onclick = (ev) => { ev.stopPropagation(); hideReactPicker(); startInlineEdit(m); };
     pk.appendChild(eb);
   }
+  const db = document.createElement('button');
+  db.type = 'button';
+  db.className = 'picker-delete';
+  db.textContent = '🗑️ Delete message';
+  db.onclick = (ev) => { ev.stopPropagation(); hideReactPicker(); deleteMessageDialog(m); };
+  pk.appendChild(db);
   document.body.appendChild(pk);
   const r = b.getBoundingClientRect();
   pk.style.left = Math.max(8, Math.min(window.innerWidth - pk.offsetWidth - 8, r.left)) + 'px';
@@ -449,6 +460,56 @@ function startInlineEdit(m) {
       alert(err.message);
     }
   };
+}
+
+// ---------------------------------------------------------------- delete message (web)
+
+const DELETE_WINDOW_MS = 48 * 60 * 60 * 1000; // delete-for-everyone: sender only, 48h
+
+function canDeleteEveryone(m) {
+  return !!(m && m.id && state.me && m.senderId === state.me.id &&
+    (Date.now() - m.createdAt < DELETE_WINDOW_MS));
+}
+
+function deleteMessageDialog(m) {
+  if (!m || !m.id || m.deleted) return;
+  const mine = m.senderId === state.me.id;
+  if (mine && canDeleteEveryone(m)) {
+    if (window.confirm('Delete this message for everyone?\n\nOK = everyone · Cancel = only for me')) {
+      doWebDelete(m, 'everyone');
+    } else if (window.confirm('Delete this message for you only?')) {
+      doWebDelete(m, 'me');
+    }
+  } else if (mine) {
+    if (window.confirm('Delete-for-everyone has expired for this message (48h).\n\nDelete it for you only?')) {
+      doWebDelete(m, 'me');
+    }
+  } else {
+    if (window.confirm('Delete this message for you?\n\nThe other person will still see it.')) {
+      doWebDelete(m, 'me');
+    }
+  }
+}
+
+async function doWebDelete(m, mode) {
+  try {
+    await api('/api/message/delete', {
+      method: 'POST',
+      body: JSON.stringify({ messageId: m.id, mode, scope: 'dm' }),
+    });
+    if (mode === 'everyone') {
+      m.deleted = true;
+      m.body = '🚫 This message was deleted';
+      m.reactions = {};
+      m.data = null;
+    } else {
+      state.active.messages = state.active.messages.filter((x) => x.id !== m.id);
+    }
+    renderMessages();
+    loadChats();
+  } catch (err) {
+    alert(err.message);
+  }
 }
 
 // --- sending
@@ -557,6 +618,19 @@ function handleWs(msg) {
         m.body = msg.newText;
         m.edited = true;
         m.editedAt = msg.editedAt;
+        renderMessages();
+        loadChats();
+      }
+      break;
+    }
+
+    case 'message-deleted': {
+      const m = state.active?.messages.find((x) => x.id === msg.messageId);
+      if (m) {
+        m.deleted = true;
+        m.body = '🚫 This message was deleted';
+        m.reactions = {};
+        m.data = null;
         renderMessages();
         loadChats();
       }

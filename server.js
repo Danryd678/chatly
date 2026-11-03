@@ -50,6 +50,9 @@ const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'chatly.
 const SESSION_COOKIE = 'chatly_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_TEXT_LEN = 2000;
+// v6.6: delete-for-everyone — sender only, within 48h of sending.
+const DELETE_EVERYONE_WINDOW_MS = 48 * 60 * 60 * 1000;
+const DELETED_PLACEHOLDER = '🚫 This message was deleted';
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const CODE_TTL_MS = 10 * 60 * 1000; // verification / reset codes live 10 min
@@ -295,6 +298,9 @@ async function initDb() {
     scope TEXT NOT NULL, -- 'dm' | 'group' | 'channel'
     PRIMARY KEY (user_id, message_id, scope)
   );`);
+
+// --- v4.3 migrations: delete-for-everyone timestamp ----------------------------
+await ensureColumn('messages', 'deleted_at', 'INTEGER'); // epoch ms of delete-for-everyone
 
 // --- v4.1 migrations: group/channel edit, invites, avatar -------------------
   await ensureColumn('groups', 'description', "TEXT NOT NULL DEFAULT ''");
@@ -805,6 +811,8 @@ function toClientMessage(m) {
     createdAt: m.created_at,
     edited: !!m.edited,
     editedAt: m.edited_at || null,
+    deleted: !!m.deleted,
+    deletedAt: m.deleted_at || null,
     viewOnce,
     viewed,
   };
@@ -2432,10 +2440,16 @@ app.get('/api/channels/:id/posts', ah(async (req, res) => {
     return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
   }
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 100);
-  const rows = await dbAll('SELECT * FROM channel_posts WHERE channel_id = ? AND deleted = 0 ORDER BY id DESC LIMIT ?', [
-    id,
-    limit,
-  ]);
+  // v6.6: delete-for-me hides posts for that user; resolve an optional user from ?token=.
+  const viewer = await getApiUser(req).catch(() => null);
+  const rows = viewer
+    ? await dbAll(`SELECT * FROM channel_posts WHERE channel_id = ? AND deleted = 0
+        AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = channel_posts.id AND dm.scope = 'channel')
+        ORDER BY id DESC LIMIT ?`, [id, viewer.id, limit])
+    : await dbAll('SELECT * FROM channel_posts WHERE channel_id = ? AND deleted = 0 ORDER BY id DESC LIMIT ?', [
+      id,
+      limit,
+    ]);
   res.json({
     channelId: id,
     posts: rows.map((p) => ({
@@ -2662,7 +2676,9 @@ app.get('/api/messages/:partnerId', requireAuth, ah(async (req, res) => {
     return res.status(404).json({ error: 'not_found', message: 'Chat not found.' });
   }
   let rows;
-  const notDeleted = `AND deleted = 0 AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = messages.id AND dm.scope = 'dm')`;
+  // v6.6: deleted-for-everyone messages stay in history as "deleted" placeholders;
+  // delete-for-me (deleted_messages) still hides them for that user only.
+  const notDeleted = `AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.user_id = ? AND dm.message_id = messages.id AND dm.scope = 'dm')`;
   const convo = `((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) AND ${live} ${notDeleted}`;
   if (after > 0) {
     // v3.6: incremental poll for messages newer than `after` (fallback when WS drops).
@@ -2771,7 +2787,9 @@ app.post('/api/message-viewed', requireApiUser, ah(async (req, res) => {
 // only for the requesting user.
 app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
   const messageId = Number(req.body && req.body.messageId);
-  const scope = req.body && req.body.scope;
+  // v6.6: scope defaults to 'dm' so bare {token, messageId, mode} calls work.
+  let scope = req.body && req.body.scope;
+  if (scope == null || scope === '') scope = 'dm';
   const forEveryone = !!(req.body && req.body.forEveryone);
   if (!Number.isInteger(messageId) || messageId <= 0) {
     return res.status(422).json({ error: 'bad_request', message: 'Message id is required.' });
@@ -2787,11 +2805,26 @@ app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
     if (m.sender_id !== userId && m.recipient_id !== userId) {
       return res.status(403).json({ error: 'forbidden', message: 'Not your conversation.' });
     }
-    if (forEveryone) {
+    // v6.6: mode 'everyone'|'me'; legacy clients send {forEveryone: bool}.
+    let mode = req.body && req.body.mode;
+    if (mode !== 'everyone' && mode !== 'me') {
+      if (mode == null || mode === '') {
+        mode = (req.body && req.body.forEveryone) ? 'everyone' : 'me';
+      } else {
+        return res.status(400).json({ error: 'bad_request', message: 'Mode must be everyone or me.' });
+      }
+    }
+    if (mode === 'everyone') {
       if (m.sender_id !== userId) {
         return res.status(403).json({ error: 'forbidden', message: 'Only the sender can delete for everyone.' });
       }
-      await dbRun('UPDATE messages SET deleted = 1 WHERE id = ?', [messageId]);
+      if (Date.now() - m.created_at > DELETE_EVERYONE_WINDOW_MS) {
+        return res.status(410).json({ error: 'expired', message: 'Delete-for-everyone window (48h) has expired.' });
+      }
+      await dbRun(
+        'UPDATE messages SET body = ?, deleted = 1, deleted_at = ?, reactions = ? WHERE id = ?',
+        [DELETED_PLACEHOLDER, Date.now(), '{}', messageId]
+      );
       const otherId = m.sender_id === userId ? m.recipient_id : m.sender_id;
       await deliverTo(otherId, userId, { type: 'message-deleted', messageId, scope: 'dm' });
     } else {
@@ -2826,15 +2859,25 @@ app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
   }
 
   // scope === 'channel'
+  // FIX (v6.6): the old code checked ch.author_id and m.sender_id, neither of
+  // which exists (channels use creator_id; only the creator can post, so the
+  // creator is the post author). Every delete call was a silent no-op/403.
   const m = await dbGet('SELECT * FROM channel_posts WHERE id = ?', [messageId]);
   if (!m) return res.status(404).json({ error: 'not_found', message: 'Message not found.' });
-  // Only the channel author or the post author can delete
   const ch = await dbGet('SELECT * FROM channels WHERE id = ?', [m.channel_id]);
   if (!ch) return res.status(404).json({ error: 'not_found', message: 'Channel not found.' });
-  const isAuthor = ch.author_id === userId;
-  if (forEveryone) {
-    if (m.sender_id !== userId && !isAuthor) {
-      return res.status(403).json({ error: 'forbidden', message: 'Only the author can delete for everyone.' });
+  const isCreator = ch.creator_id === userId;
+  let mode = req.body && req.body.mode;
+  if (mode !== 'everyone' && mode !== 'me') {
+    if (mode == null || mode === '') {
+      mode = (req.body && req.body.forEveryone) ? 'everyone' : 'me';
+    } else {
+      return res.status(400).json({ error: 'bad_request', message: 'Mode must be everyone or me.' });
+    }
+  }
+  if (mode === 'everyone') {
+    if (!isCreator) {
+      return res.status(403).json({ error: 'forbidden', message: 'Only the channel creator can delete a post.' });
     }
     await dbRun('UPDATE channel_posts SET deleted = 1 WHERE id = ?', [messageId]);
     const subs = await dbAll('SELECT user_id FROM channel_subs WHERE channel_id = ? AND user_id != ?',
@@ -2843,6 +2886,12 @@ app.post('/api/message/delete', requireApiUser, ah(async (req, res) => {
       await deliverTo(s.user_id, userId, { type: 'message-deleted', messageId, scope: 'channel', channelId: m.channel_id });
     }
   } else {
+    // delete-for-me: must be subscribed (or the creator) to hide a post.
+    const sub = await dbGet('SELECT 1 AS x FROM channel_subs WHERE channel_id = ? AND user_id = ?',
+      [m.channel_id, userId]);
+    if (!sub) {
+      return res.status(403).json({ error: 'forbidden', message: 'Not subscribed to this channel.' });
+    }
     await dbRun('INSERT OR IGNORE INTO deleted_messages (user_id, message_id, scope) VALUES (?, ?, ?)',
       [userId, messageId, 'channel']);
   }
