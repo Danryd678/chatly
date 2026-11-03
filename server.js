@@ -168,6 +168,13 @@ async function initDb() {
     expire_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_statuses_expire ON statuses(expire_at);
+  CREATE TABLE IF NOT EXISTS status_views (
+    status_id INTEGER NOT NULL REFERENCES statuses(id) ON DELETE CASCADE,
+    viewer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    viewed_at INTEGER NOT NULL,
+    PRIMARY KEY (status_id, viewer_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_status_views_viewer ON status_views(viewer_id);
 `);
 
 // --- v3.1: broadcast channels ------------------------------------------------
@@ -2779,21 +2786,36 @@ app.post('/api/status', requireApiUser, ah(async (req, res) => {
 
 // GET /api/status/feed?token= — all non-expired statuses, newest first, cap 100.
 // Hides statuses from users you blocked or who blocked you.
+// Also returns groups[] for story rings: [{userId, username, name, avatar, items, viewed:[ids], mine}].
 app.get('/api/status/feed', requireApiUser, ah(async (req, res) => {
   await purgeStatuses();
   const rows = await dbAll('SELECT * FROM statuses ORDER BY created_at DESC LIMIT 100');
   const myBlocked = await blockedIds(req.user.id);
+  const viewedRows = await dbAll('SELECT status_id FROM status_views WHERE viewer_id = ?', [req.user.id]);
+  const viewedSet = new Set(viewedRows.map(r => r.status_id));
   const feed = [];
+  const groups = [];
+  const byUser = new Map();
   for (const s of rows) {
-    if (s.user_id === req.user.id) {
-      feed.push(await toClientStatus(s));
-      continue;
+    const mine = s.user_id === req.user.id;
+    if (!mine) {
+      if (myBlocked.has(s.user_id)) continue; // I blocked them
+      if (await isBlocked(req.user.id, s.user_id)) continue; // they blocked me
     }
-    if (myBlocked.has(s.user_id)) continue; // I blocked them
-    if (await isBlocked(req.user.id, s.user_id)) continue; // they blocked me
-    feed.push(await toClientStatus(s));
+    const cs = await toClientStatus(s);
+    feed.push(cs);
+    let g = byUser.get(s.user_id);
+    if (!g) {
+      g = { userId: s.user_id, username: cs.username, name: cs.name, avatar: cs.avatar,
+            items: [], viewed: [], mine };
+      byUser.set(s.user_id, g);
+      groups.push(g);
+    }
+    g.items.push(cs);
+    if (viewedSet.has(s.id)) g.viewed.push(s.id);
   }
-  res.json({ statuses: feed });
+  groups.sort((a, b) => (b.mine - a.mine) || (b.items[0].ts - a.items[0].ts));
+  res.json({ statuses: feed, groups });
 }));
 
 // DELETE /api/status/:id {token} — owner only.
@@ -2807,6 +2829,46 @@ app.delete('/api/status/:id', requireApiUser, ah(async (req, res) => {
   (await dbRun('DELETE FROM statuses WHERE id = ?', [id]));
   res.json({ ok: true });
 }));
+
+// POST /api/status/:id/view {token} — mark a status as viewed (idempotent).
+app.post('/api/status/:id/view', requireApiUser, ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const s = (await dbGet('SELECT * FROM statuses WHERE id = ?', [id]));
+  if (!s || s.expire_at <= Date.now()) return res.status(404).json({ error: 'not_found', message: 'Status not found.' });
+  if (s.user_id === req.user.id) return res.json({ ok: true, viewed: true }); // own status: no-op
+  const myBlocked = await blockedIds(req.user.id);
+  if (myBlocked.has(s.user_id) || (await isBlocked(req.user.id, s.user_id))) {
+    return res.status(403).json({ error: 'forbidden', message: 'Not allowed.' });
+  }
+  (await dbRun('INSERT OR IGNORE INTO status_views (status_id, viewer_id, viewed_at) VALUES (?, ?, ?)',
+    [id, req.user.id, Date.now()]));
+  res.json({ ok: true, viewed: true });
+}));
+
+// GET /api/status/:id/views?token= — owner sees who viewed (newest first).
+app.get('/api/status/:id/views', requireApiUser, ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const s = (await dbGet('SELECT * FROM statuses WHERE id = ?', [id]));
+  if (!s) return res.status(404).json({ error: 'not_found', message: 'Status not found.' });
+  if (s.user_id !== req.user.id) {
+    return res.status(403).json({ error: 'forbidden', message: 'Only the owner can see views.' });
+  }
+  const rows = await dbAll(
+    `SELECT v.viewed_at, u.id AS user_id, u.username, u.display_name, u.avatar
+     FROM status_views v JOIN users u ON u.id = v.viewer_id
+     WHERE v.status_id = ? ORDER BY v.viewed_at DESC LIMIT 200`, [id]);
+  res.json({ views: rows.map(r => ({
+    userId: r.user_id,
+    username: r.username,
+    name: r.display_name || r.username,
+    avatar: r.avatar || null,
+    viewedAt: Math.floor(r.viewed_at / 1000),
+  })) });
+}));
+
+// Hourly safety net: purge expired statuses even when nobody reads the feed.
+const _statusPurgeTimer = setInterval(() => { purgeStatuses().catch(() => {}); }, 60 * 60 * 1000);
+if (_statusPurgeTimer.unref) _statusPurgeTimer.unref();
 
 // --- channels (broadcast) -----------------------------------------------------
 
