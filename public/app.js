@@ -42,6 +42,11 @@ function fmtTime(ts) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function fmtDur(s) {
+  s = Math.max(0, Math.round(Number(s) || 0));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
 function avatarColor(name) {
   let h = 0;
   for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360;
@@ -170,7 +175,7 @@ function renderChats() {
         <div class="chat-name"><span>${esc(p.username)}</span>
           <span class="time">${last ? fmtTime(last.createdAt) : ''}</span></div>
         <div class="chat-preview">
-          <span>${ticks} ${last ? esc(last.body.slice(0, 60)) : ''}</span>
+          <span>${ticks} ${last ? (voicePreview(last) || esc(last.body.slice(0, 60))) : ''}</span>
           ${unread ? `<span class="unread">${unread}</span>` : ''}
         </div>
       </div>`;
@@ -243,6 +248,7 @@ function refreshConvoHeader() {
 }
 
 async function openChat(partnerId, username) {
+  stopVoiceNote();
   state.active = { partnerId, username, messages: [] };
   $('convo-name').textContent = username;
   $('messages').innerHTML = '';
@@ -283,6 +289,9 @@ function renderMessages() {
     const editedTag = m.edited ? '<span class="edited-tag">edited</span>' : '';
     if (m.deleted) {
       b.innerHTML = `<span class="deleted-text">🚫 This message was deleted</span><span class="meta">${fmtTime(m.createdAt)}${ticks}</span>`;
+    } else if (m.kind === 'audio' && m.data) {
+      const uid = m.id != null ? m.id : m.tempId;
+      b.innerHTML = `${m.body ? esc(m.body) : ''}<div class="voice-row"><button type="button" class="voice-play" data-vplay="${uid}" aria-label="Play voice note">▶</button><div class="voice-track" data-vtrack="${uid}"><div class="voice-fill" data-vfill="${uid}"></div></div><span class="voice-dur">${fmtDur(m.durationSec)}</span></div><span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
     } else {
       b.innerHTML = `${replyQuoteHtml(m)}${esc(m.body)}<span class="meta">${editedTag}${fmtTime(m.createdAt)}${ticks}</span>${reactionPillsHtml(m)}`;
     }
@@ -495,6 +504,7 @@ const EDIT_WINDOW_MS = 15 * 60 * 1000;
 
 function canEditMessage(m) {
   return !!(m && m.id && state.me && m.senderId === state.me.id &&
+    (!m.kind || m.kind === 'text') && // v6.8: text only — voice notes can't be edited
     (Date.now() - m.createdAt < EDIT_WINDOW_MS));
 }
 
@@ -586,6 +596,181 @@ async function doWebDelete(m, mode) {
   } catch (err) {
     alert(err.message);
   }
+}
+
+// ---------------------------------------------------------------- voice notes (web, v6.8)
+
+const VOICE_MAX_SEC = 120; // client-side cap: 2 minutes
+let voiceAudio = null;
+let voicePlayingUid = null;
+let recStream = null, recRecorder = null, recChunks = [], recStartTs = 0;
+let recTimerInt = null, recMime = '', recStopping = false;
+
+function voicePreview(m) {
+  if (!m || m.kind !== 'audio') return null;
+  return '🎤 Voice note' + (m.durationSec ? ' (' + fmtDur(m.durationSec) + ')' : '');
+}
+
+function playVoiceNote(m, btn) {
+  const uid = String(m.id != null ? m.id : m.tempId);
+  if (voiceAudio && voicePlayingUid === uid) {
+    if (voiceAudio.paused) { voiceAudio.play().catch(() => {}); btn.textContent = '⏸'; }
+    else { voiceAudio.pause(); btn.textContent = '▶'; }
+    return;
+  }
+  stopVoiceNote();
+  const mime = m.mime || 'audio/mp4';
+  voiceAudio = new Audio('data:' + mime + ';base64,' + m.data);
+  voicePlayingUid = uid;
+  const fill = document.querySelector('[data-vfill="' + uid + '"]');
+  voiceAudio.addEventListener('timeupdate', () => {
+    if (fill && voiceAudio && voiceAudio.duration) {
+      fill.style.width = (voiceAudio.currentTime / voiceAudio.duration * 100) + '%';
+    }
+  });
+  const reset = () => {
+    btn.textContent = '▶';
+    if (fill) fill.style.width = '0%';
+    if (voicePlayingUid === uid) voicePlayingUid = null;
+  };
+  voiceAudio.addEventListener('ended', reset);
+  voiceAudio.addEventListener('error', reset);
+  voiceAudio.play().then(() => { btn.textContent = '⏸'; }).catch(() => { btn.textContent = '▶'; voicePlayingUid = null; });
+}
+
+function stopVoiceNote() {
+  if (voiceAudio) { try { voiceAudio.pause(); } catch {} voiceAudio = null; }
+  voicePlayingUid = null;
+  document.querySelectorAll('.voice-play').forEach((el) => { el.textContent = '▶'; });
+  document.querySelectorAll('.voice-fill').forEach((el) => { el.style.width = '0%'; });
+}
+
+function cleanupRec() {
+  if (recStream) { recStream.getTracks().forEach((t) => { try { t.stop(); } catch {} }); recStream = null; }
+  recRecorder = null;
+  recStopping = false;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const s = String(fr.result || '');
+      const i = s.indexOf(',');
+      resolve(i >= 0 ? s.slice(i + 1) : '');
+    };
+    fr.onerror = () => resolve('');
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function startWebRecording() {
+  if (!state.active || recRecorder) return;
+  if (!window.MediaRecorder || !navigator.mediaDevices) {
+    alert('Voice notes are not supported in this browser.');
+    return;
+  }
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    alert("Couldn't access the microphone.");
+    return;
+  }
+  recChunks = [];
+  recMime = '';
+  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) recMime = 'audio/webm;codecs=opus';
+  else if (MediaRecorder.isTypeSupported('audio/mp4')) recMime = 'audio/mp4';
+  try {
+    recRecorder = recMime ? new MediaRecorder(recStream, { mimeType: recMime }) : new MediaRecorder(recStream);
+  } catch {
+    cleanupRec();
+    alert("Couldn't start recording.");
+    return;
+  }
+  recStopping = false;
+  recRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recRecorder.onstop = onRecStopped;
+  recRecorder.start(250);
+  recStartTs = Date.now();
+  $('btn-mic').classList.add('recording');
+  const input = $('input-message');
+  input.disabled = true;
+  input.placeholder = '● 0:00 — release to send';
+  recTimerInt = setInterval(() => {
+    const s = Math.floor((Date.now() - recStartTs) / 1000);
+    input.placeholder = '● ' + fmtDur(s) + ' — release to send';
+    if (s >= VOICE_MAX_SEC) stopWebRecording(); // auto-stop at 2 minutes
+  }, 500);
+}
+
+function stopWebRecording() {
+  if (!recRecorder || recStopping) return;
+  recStopping = true;
+  clearInterval(recTimerInt);
+  recTimerInt = null;
+  try { recRecorder.stop(); } catch { onRecStopped(); }
+}
+
+async function onRecStopped() {
+  const btn = $('btn-mic');
+  if (btn) btn.classList.remove('recording');
+  const input = $('input-message');
+  if (input) { input.disabled = false; input.placeholder = 'Type a message'; }
+  const secs = Math.round((Date.now() - recStartTs) / 1000);
+  const chunks = recChunks;
+  recChunks = [];
+  const mime = recMime;
+  cleanupRec();
+  if (secs < 1 || !chunks.length) return;
+  const b64 = await blobToBase64(new Blob(chunks, { type: mime || 'audio/webm' }));
+  if (!b64 || b64.length > 1400000) { // ~1MB decoded cap
+    alert('Voice note too long — keep it under 2 minutes.');
+    return;
+  }
+  sendVoiceNote(b64, mime || 'audio/webm', Math.min(secs, VOICE_MAX_SEC));
+}
+
+function sendVoiceNote(b64, mime, secs) {
+  if (!state.active) return;
+  const tempId = 't' + (++state.tempSeq);
+  const optimistic = {
+    id: null, tempId, senderId: state.me.id, body: '', kind: 'audio',
+    data: b64, mime, durationSec: secs, status: 0, createdAt: Date.now(),
+  };
+  state.active.messages.push(optimistic);
+  renderMessages();
+  const payload = {
+    type: 'send', to: state.active.partnerId, kind: 'audio',
+    data: b64, mime, durationSec: secs, tempId,
+  };
+  const ok = wsSend(payload);
+  if (!ok) {
+    state.active.messages = state.active.messages.filter((m) => m.tempId !== tempId);
+    renderMessages();
+    alert('Not connected — trying to reconnect…');
+  }
+}
+
+function wireMicButton() {
+  const mic = $('btn-mic');
+  if (!mic || mic.dataset.wired) return;
+  mic.dataset.wired = '1';
+  mic.addEventListener('mousedown', (e) => { e.preventDefault(); startWebRecording(); });
+  mic.addEventListener('mouseup', () => stopWebRecording());
+  mic.addEventListener('mouseleave', () => stopWebRecording());
+  mic.addEventListener('touchstart', (e) => { e.preventDefault(); startWebRecording(); }, { passive: false });
+  mic.addEventListener('touchend', (e) => { e.preventDefault(); stopWebRecording(); });
+  mic.addEventListener('touchcancel', () => stopWebRecording());
+  mic.addEventListener('contextmenu', (e) => e.preventDefault());
+  // delegated voice-play clicks (bubbles re-render, so delegation is sturdier)
+  $('messages').addEventListener('click', (ev) => {
+    const vp = ev.target.closest('.voice-play');
+    if (!vp || !state.active) return;
+    const uid = vp.dataset.vplay;
+    const m = state.active.messages.find(
+      (x) => String(x.id) === uid || String(x.tempId) === uid);
+    if (m && m.data) { ev.stopPropagation(); playVoiceNote(m, vp); }
+  });
 }
 
 // --- sending
@@ -783,4 +968,5 @@ $('btn-logout').onclick = async () => {
 
 // ---------------------------------------------------------------- start
 
+wireMicButton();
 boot();

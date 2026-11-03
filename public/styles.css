@@ -176,6 +176,36 @@ html, body {
 }
 .btn-send:active { background: var(--teal-dark); }
 
+/* ---------- voice notes (v6.8) ---------- */
+
+.btn-mic {
+  width: 48px; height: 48px; border-radius: 50%; border: none; cursor: pointer;
+  background: #e9edef; color: var(--ink); font-size: 22px; flex-shrink: 0;
+  user-select: none; -webkit-user-select: none; touch-action: none;
+}
+.btn-mic.recording { background: #e0245e; color: #fff; animation: micpulse 1s infinite; }
+@keyframes micpulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 36, 94, .5); }
+  50% { box-shadow: 0 0 0 10px rgba(224, 36, 94, 0); }
+}
+#input-message:disabled { background: #fde8ee; color: #b0003a; }
+
+.voice-row { display: flex; align-items: center; gap: 8px; min-width: 190px; padding: 2px 0; }
+.voice-play {
+  width: 38px; height: 38px; border-radius: 50%; border: none; cursor: pointer; flex-shrink: 0;
+  background: var(--teal); color: #fff; font-size: 15px;
+}
+.voice-play:active { background: var(--teal-dark); }
+.voice-track {
+  flex: 1; height: 5px; border-radius: 3px; background: rgba(0, 0, 0, .15); overflow: hidden;
+}
+.voice-fill { height: 100%; width: 0%; background: var(--teal); border-radius: 3px; }
+.voice-dur { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.bubble.mine .voice-dur { color: rgba(255, 255, 255, .85); }
+.bubble.mine .voice-track { background: rgba(255, 255, 255, .3); }
+.bubble.mine .voice-fill { background: #fff; }
+.bubble.mine .voice-play { background: rgba(255, 255, 255, .25); }
+
 /* ---------- reactions ---------- */
 
 .react-pills { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
