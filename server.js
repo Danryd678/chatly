@@ -1205,8 +1205,8 @@ async function geminiAttempt(ki, key, contents) {
   };
   let r;
   try {
-    // NOTE: model MUST be gemini-flash-latest — gemini-2.5-flash 404s on v1beta.
-    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent', {
+    // NOTE: model is gemini-3.5-flash-lite (stable, free tier) — gemini-flash-latest alias was throttled into retirement Nov 2026.
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify({ systemInstruction, contents, generationConfig: { maxOutputTokens: 1024 } }),
