@@ -1121,6 +1121,19 @@ const ah = (fn) => async (req, res, next) => {
 // global JSON body parser so it can use its own 3mb limit (photo messages
 // carry base64 JPEGs). Handler + helpers live in the "AI proxy" section below
 // (function declarations hoist, so this is safe).
+// CORS for /api/ai only: the endpoint is intentionally public and
+// rate-limited, but browsers block cross-origin calls without these headers.
+// Lets browser pages (e.g. Builder) call the same proxy the Android app uses.
+app.options('/api/ai', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+app.use('/api/ai', (req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  next();
+});
 app.post('/api/ai', express.json({ limit: '3mb' }), aiRateLimit, ah(aiHandler));
 // POST /api/publish — Chatly AI "Publish & Get Link": stores a self-contained
 // HTML website and returns a public shareable URL. Public (the app has no
